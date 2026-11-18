@@ -1161,21 +1161,32 @@ fn flat_button(ui: &mut egui::Ui, text: &str) -> bool {
     .clicked()
 }
 
-/// A switch. The knob is the only round thing in the launcher (R5Regenis' rule).
+/// A switch, drawn like R5Regenis' (Theme/Styles.axaml `ToggleButton.switch`): a 42x24 pill with a hairline
+/// border and a 16px knob that slides right and turns cyan when on.
 fn toggle(ui: &mut egui::Ui, value: &mut bool, enabled: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 18.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(42.0, 24.0), Sense::click());
     let mut changed = false;
     if enabled && response.clicked() {
         *value = !*value;
         changed = true;
     }
-    let t = ui.ctx().animate_bool_with_time(response.id, *value, 0.12);
-    let track = if enabled { mix(RAISED, Color32::from_rgb(40, 140, 168), t) } else { RAISED };
-    let hover = enabled && response.hovered();
-    ui.painter().rect_filled(rect, Rounding::same(0.0), if hover && t < 0.5 { HOVER } else { track });
-    let knob_x = egui::lerp(rect.left() + 9.0..=rect.right() - 9.0, t);
-    let knob = if enabled { mix(SECONDARY, Color32::WHITE, t) } else { MUTED };
-    ui.painter().circle_filled(Pos2::new(knob_x, rect.center().y), 6.0, knob);
+    let t = ui.ctx().animate_bool_with_time(response.id, *value, 0.14);
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), enabled && response.hovered(), 0.12);
+    let off_border = mix(Color32::from_rgb(44, 56, 72), Color32::from_rgb(70, 84, 102), hover);
+    let (fill, border, knob) = if enabled {
+        (
+            mix(BG, Color32::from_rgb(14, 52, 64), t),
+            mix(off_border, Color32::from_rgb(38, 150, 180), t),
+            mix(mix(MUTED, SECONDARY, hover), CYAN, t),
+        )
+    } else {
+        (BG, Color32::from_rgb(32, 40, 52), Color32::from_rgb(58, 66, 78))
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, Rounding::same(12.0), fill);
+    p.rect_stroke(rect.shrink(0.5), Rounding::same(12.0), Stroke::new(1.0_f32, border));
+    let knob_x = egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, t);
+    p.circle_filled(Pos2::new(knob_x, rect.center().y), 8.0, knob);
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
@@ -1214,8 +1225,21 @@ fn slider_row(
             ui.set_width(170.0);
             ui.label(RichText::new(title).size(13.0).color(if enabled { TEXT } else { MUTED }));
         });
-        let slider = egui::Slider::new(value, range).step_by(step).suffix(suffix).fixed_decimals(decimals).trailing_fill(true);
-        let r = ui.add_enabled(enabled, slider);
+        let slider = egui::Slider::new(value, range).step_by(step).show_value(false).trailing_fill(true);
+        // A smaller knob drawn as a cyan ring (the rail and the knob share the widget fill in egui).
+        let r = ui
+            .scope(|ui| {
+                ui.spacing_mut().interact_size.y = 18.0;
+                let w = &mut ui.visuals_mut().widgets;
+                w.inactive.fg_stroke = Stroke::new(2.0_f32, CYAN);
+                w.hovered.fg_stroke = Stroke::new(2.0_f32, CYAN_HI);
+                w.active.fg_stroke = Stroke::new(2.0_f32, CYAN_HI);
+                ui.add_enabled(enabled, slider)
+            })
+            .inner;
+        ui.add_space(10.0);
+        let shown = format!("{:.*}{suffix}", decimals, *value);
+        ui.label(RichText::new(shown).monospace().size(13.0).color(if enabled { TEXT } else { MUTED }));
         settled = r.drag_stopped() || (r.changed() && !r.dragged());
     });
     ui.add_space(4.0);
@@ -1547,6 +1571,7 @@ fn apply_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
     style.spacing.slider_width = 360.0;
+    style.spacing.slider_rail_height = 4.0;
     style.spacing.interact_size.y = 22.0;
     ctx.set_style(style);
 }
