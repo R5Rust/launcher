@@ -253,6 +253,8 @@ impl GameSettings {
 pub struct GraphicsSettings {
     pub preset: String,
     pub texture_quality: String,
+    /// Apex's Model Detail (static-prop LOD distance): low / medium / high
+    pub model_detail: String,
     pub anisotropic: i64,
     pub sun_shadows: String,
     pub msaa: i64,
@@ -264,10 +266,11 @@ pub struct GraphicsSettings {
 pub const PRESETS: [&str; 5] = ["lowest", "low", "medium", "high", "ultra"];
 pub const TEXTURE_LEVELS: [&str; 5] = ["lowest", "low", "medium", "high", "ultra"];
 pub const SHADOW_LEVELS: [&str; 3] = ["off", "low", "high"];
+pub const MODEL_LEVELS: [&str; 3] = ["low", "medium", "high"];
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        let mut g = Self { preset: String::new(), texture_quality: String::new(), anisotropic: 8, sun_shadows: String::new(), msaa: 4, render_scale: 100, vsync: false, fps_cap: 0 };
+        let mut g = Self { preset: String::new(), texture_quality: String::new(), model_detail: String::new(), anisotropic: 8, sun_shadows: String::new(), msaa: 4, render_scale: 100, vsync: false, fps_cap: 0 };
         g.apply_preset("high");
         g
     }
@@ -276,15 +279,16 @@ impl Default for GraphicsSettings {
 impl GraphicsSettings {
     /// Same table as the game's `GraphicsSettings::preset` (vsync, fps cap and render scale are kept).
     pub fn apply_preset(&mut self, p: &str) {
-        let (tex, aniso, shadows, msaa) = match p {
-            "lowest" => ("lowest", 1, "off", 1),
-            "low" => ("low", 2, "off", 1),
-            "medium" => ("medium", 4, "low", 1),
-            "high" => ("high", 8, "high", 4),
-            _ => ("ultra", 16, "high", 4),
+        let (tex, model, aniso, shadows, msaa) = match p {
+            "lowest" => ("lowest", "low", 1, "off", 1),
+            "low" => ("low", "low", 2, "off", 1),
+            "medium" => ("medium", "medium", 4, "low", 1),
+            "high" => ("high", "high", 8, "high", 4),
+            _ => ("ultra", "high", 16, "high", 4),
         };
         self.preset = p.to_owned();
         self.texture_quality = tex.to_owned();
+        self.model_detail = model.to_owned();
         self.anisotropic = aniso;
         self.sun_shadows = shadows.to_owned();
         self.msaa = msaa;
@@ -311,6 +315,7 @@ impl GraphicsSettings {
         Self {
             preset: s("preset", &d.preset),
             texture_quality: s("texture_quality", &d.texture_quality),
+            model_detail: s("model_detail", &d.model_detail),
             anisotropic: i("anisotropic", d.anisotropic),
             sun_shadows: s("sun_shadows", &d.sun_shadows),
             msaa: i("msaa", d.msaa),
@@ -327,6 +332,7 @@ impl GraphicsSettings {
         let t = &mut doc["graphics"];
         t["preset"] = toml_edit::value(self.preset.as_str());
         t["texture_quality"] = toml_edit::value(self.texture_quality.as_str());
+        t["model_detail"] = toml_edit::value(self.model_detail.as_str());
         t["anisotropic"] = toml_edit::value(self.anisotropic);
         t["sun_shadows"] = toml_edit::value(self.sun_shadows.as_str());
         t["msaa"] = toml_edit::value(self.msaa);

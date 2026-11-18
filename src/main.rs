@@ -1382,6 +1382,9 @@ impl LauncherApp {
                     let tex = levels(&game::TEXTURE_LEVELS);
                     let tex: Vec<(String, &str)> = tex.iter().map(|(v, l)| (v.clone(), l.as_str())).collect();
                     knobs |= choice_row(ui, "Texture quality", &mut g.texture_quality, &tex, editable);
+                    let md = levels(&game::MODEL_LEVELS);
+                    let md: Vec<(String, &str)> = md.iter().map(|(v, l)| (v.clone(), l.as_str())).collect();
+                    knobs |= choice_row(ui, "Model detail", &mut g.model_detail, &md, editable);
                     let sh = levels(&game::SHADOW_LEVELS);
                     let sh: Vec<(String, &str)> = sh.iter().map(|(v, l)| (v.clone(), l.as_str())).collect();
                     knobs |= choice_row(ui, "Sun shadows", &mut g.sun_shadows, &sh, editable);
