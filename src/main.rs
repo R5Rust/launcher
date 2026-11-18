@@ -1,20 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+mod game;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::{path::PathBuf, time::Duration};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Rounding, Sense, Stroke,
-    Vec2,
+    self, Align, Align2, Color32, FontId, Key, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
+use game::{GameState, Job, JobKind, Poller, Snapshot};
 
-const DEFAULT_GAME_DIR: &str = r"C:\Code\games\r5rust";
 const RAIL: Color32 = Color32::from_rgb(12, 17, 23);
 const BG: Color32 = Color32::from_rgb(10, 14, 19);
 const PANEL: Color32 = Color32::from_rgb(17, 23, 33);
@@ -25,6 +19,12 @@ const SECONDARY: Color32 = Color32::from_rgb(147, 161, 179);
 const MUTED: Color32 = Color32::from_rgb(95, 107, 123);
 const BORDER: Color32 = Color32::from_rgb(25, 33, 44);
 const CYAN: Color32 = Color32::from_rgb(63, 216, 255);
+const INK: Color32 = Color32::from_rgb(8, 19, 26);
+const AMBER: Color32 = Color32::from_rgb(255, 186, 82);
+const RED: Color32 = Color32::from_rgb(255, 107, 94);
+
+const RAIL_W: f32 = 228.0;
+const FOOTER_H: f32 = 94.0;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -37,7 +37,6 @@ fn main() -> eframe::Result<()> {
             .with_icon(load_window_icon()),
         ..Default::default()
     };
-
     eframe::run_native(
         "R5Rust Launcher",
         options,
@@ -50,22 +49,66 @@ fn load_window_icon() -> egui::IconData {
         .expect("the R5Rust app icon should be available")
         .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
-    egui::IconData {
-        rgba: icon.into_raw(),
-        width: 256,
-        height: 256,
-    }
+    egui::IconData { rgba: icon.into_raw(), width: 256, height: 256 }
 }
 
 fn display_font(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("Barlow Condensed".into()))
 }
 
+fn texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> (egui::TextureHandle, Vec2) {
+    let image = image::load_from_memory(bytes).expect("bundled image should decode");
+    let size = Vec2::new(image.width() as f32, image.height() as f32);
+    let rgba = image.to_rgba8();
+    let handle = ctx.load_texture(
+        name,
+        egui::ColorImage::from_rgba_unmultiplied([size.x as usize, size.y as usize], &rgba),
+        egui::TextureOptions::LINEAR,
+    );
+    (handle, size)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Play,
+    Notes,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Info,
+    Good,
+    Bad,
+}
+
+impl Tone {
+    fn color(self) -> Color32 {
+        match self {
+            Tone::Info => SECONDARY,
+            Tone::Good => CYAN,
+            Tone::Bad => RED,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlayPhase {
+    Idle,
+    Starting,
+    Running,
+}
+
 struct LauncherApp {
     game_root: PathBuf,
-    notice: Option<(String, bool)>,
-    selected_mode: GameMode,
+    poller: Poller,
+    page: Page,
+    notice: Option<(String, Tone)>,
     mode_menu_open: bool,
+    launch_args: String,
+    play_job: Option<Job>,
+    build_job: Option<Job>,
+    build_panel_open: bool,
     cover: egui::TextureHandle,
     cover_size: Vec2,
     logo: egui::TextureHandle,
@@ -74,46 +117,28 @@ struct LauncherApp {
 impl LauncherApp {
     fn new(ctx: &egui::Context) -> Self {
         apply_theme(ctx);
-
-        let image = image::load_from_memory(include_bytes!("../assets/firing-range.jpg"))
-            .expect("the Firing Range image should be available");
-        let cover_size = Vec2::new(image.width() as f32, image.height() as f32);
-        let cover_rgba = image.to_rgba8();
-        let cover = ctx.load_texture(
-            "firing-range-cover",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [cover_size.x as usize, cover_size.y as usize],
-                &cover_rgba,
-            ),
-            egui::TextureOptions::LINEAR,
-        );
-
-        let logo_image = image::load_from_memory(include_bytes!("../assets/icon.png"))
-            .expect("the R5Rust app icon should be available");
-        let logo_size = Vec2::new(logo_image.width() as f32, logo_image.height() as f32);
-        let logo_rgba = logo_image.to_rgba8();
-        let logo = ctx.load_texture(
-            "r5rust-logo",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [logo_size.x as usize, logo_size.y as usize],
-                &logo_rgba,
-            ),
-            egui::TextureOptions::LINEAR,
-        );
-
+        let (cover, cover_size) = texture(ctx, "firing-range-cover", include_bytes!("../assets/firing-range.jpg"));
+        let (logo, _) = texture(ctx, "r5rust-logo", include_bytes!("../assets/icon.png"));
+        let game_root = game::load_game_root();
         Self {
-            game_root: load_game_root(),
+            poller: Poller::start(game_root.clone(), ctx.clone()),
+            game_root,
+            // `--page=notes` / `--page=settings` opens on that page (handy for shortcuts and screenshots).
+            page: match std::env::args().find_map(|a| a.strip_prefix("--page=").map(str::to_owned)).as_deref() {
+                Some("notes") => Page::Notes,
+                Some("settings") => Page::Settings,
+                _ => Page::Play,
+            },
             notice: None,
-            selected_mode: GameMode::FiringRange,
             mode_menu_open: false,
+            launch_args: game::load_launch_args(),
+            play_job: None,
+            build_job: None,
+            build_panel_open: false,
             cover,
             cover_size,
             logo,
         }
-    }
-
-    fn state(&self) -> GameState {
-        inspect_game(&self.game_root)
     }
 
     fn browse(&mut self) {
@@ -121,431 +146,811 @@ impl LauncherApp {
         if self.game_root.is_dir() {
             dialog = dialog.set_directory(&self.game_root);
         }
-
         if let Some(folder) = dialog.pick_folder() {
             self.game_root = folder;
             self.notice = None;
-            if let Err(error) = save_game_root(&self.game_root) {
-                self.notice = Some((format!("Couldn't save this folder: {error}"), true));
+            self.poller.set_root(self.game_root.clone());
+            if let Err(error) = game::write_setting("game_path.txt", &self.game_root.to_string_lossy()) {
+                self.notice = Some((format!("Couldn't save this folder: {error}"), Tone::Bad));
             }
         }
     }
 
-    fn launch(&mut self) {
-        match self.selected_mode {
-            GameMode::FiringRange => self.launch_game_script(),
+    fn launch(&mut self, ctx: &egui::Context) {
+        let args = game::split_args(&self.launch_args);
+        match Job::start(JobKind::Play, &self.game_root, &args, ctx.clone()) {
+            Ok(job) => {
+                self.play_job = Some(job);
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some((error, Tone::Bad)),
+        }
+        self.poller.refresh();
+    }
+
+    fn build(&mut self, ctx: &egui::Context) {
+        match Job::start(JobKind::Build, &self.game_root, &[], ctx.clone()) {
+            Ok(job) => {
+                self.build_job = Some(job);
+                self.build_panel_open = true;
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some((error, Tone::Bad)),
         }
     }
 
-    fn launch_game_script(&mut self) {
-        let script = self.game_root.join("play.ps1");
-        let mut command = Command::new("pwsh");
-        command
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-            ])
-            .arg(script)
-            .current_dir(&self.game_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+    fn building(&self) -> bool {
+        self.build_job.as_ref().is_some_and(Job::running)
+    }
 
-        #[cfg(windows)]
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    fn phase(&self, snap: &Snapshot) -> PlayPhase {
+        match &self.play_job {
+            Some(job) if job.running() => {
+                if snap.running || game::process_running("r5rust.exe") {
+                    PlayPhase::Running
+                } else {
+                    PlayPhase::Starting
+                }
+            }
+            _ if snap.running => PlayPhase::Running,
+            _ => PlayPhase::Idle,
+        }
+    }
 
-        match command.spawn() {
-            Ok(_) => self.notice = Some(("Starting Firing Range…".to_owned(), false)),
-            Err(error) => self.notice = Some((format!("Couldn't start PowerShell: {error}"), true)),
+    /// Notices when play.ps1 or publish.ps1 finish, and says how it went.
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
+        if let Some(job) = &mut self.play_job
+            && job.poll()
+        {
+            let ran = job.elapsed();
+            self.notice = if job.succeeded() && ran > Duration::from_secs(5) {
+                Some((format!("Session ended after {}.", fmt_duration(ran)), Tone::Info))
+            } else {
+                let why = job.failure_line().unwrap_or_else(|| "no output".into());
+                Some((format!("The game didn't start: {why}"), Tone::Bad))
+            };
+            self.play_job = None;
+            self.poller.refresh();
+        }
+        if let Some(job) = &mut self.build_job
+            && job.poll()
+        {
+            self.notice = if job.succeeded() {
+                Some(("Build staged. It installs the next time you press Play.".into(), Tone::Good))
+            } else {
+                let why = job.failure_line().unwrap_or_else(|| "see the build log".into());
+                Some((format!("Build failed: {why}"), Tone::Bad))
+            };
+            self.poller.refresh();
+        }
+        if self.play_job.is_some() || self.building() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 }
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let state = self.state();
-        let mut browse_clicked = false;
-        let mut launch_clicked = false;
-        let mut select_firing_range = false;
-        let mut toggle_modes_menu = false;
-        let mut mode_menu_position = Pos2::ZERO;
+        self.poll_jobs(ctx);
+        let snap = self.poller.get();
+        let phase = self.phase(&snap);
+        let can_play = snap.is_ready() && phase == PlayPhase::Idle;
+        let can_build = matches!(snap.state, GameState::Ready | GameState::NoBuild)
+            && !self.building()
+            && self.game_root.join("tools/publish.ps1").is_file();
 
+        let mut launch_clicked = false;
+        let mut build_clicked = false;
+        let mut browse_clicked = false;
+
+        self.rail(ctx, &snap);
+        egui::TopBottomPanel::bottom("play-footer")
+            .exact_height(FOOTER_H)
+            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(30.0, 13.0)))
+            .show(ctx, |ui| {
+                let (play, build) = self.footer(ui, &snap, phase, can_play, can_build);
+                launch_clicked = play;
+                build_clicked = build;
+            });
+
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(BG).inner_margin(0.0)).show(ctx, |ui| {
+            match self.page {
+                Page::Play => self.play_page(ui, ctx, phase),
+                Page::Notes => self.notes_page(ui, &snap),
+                Page::Settings => browse_clicked = self.settings_page(ui, &snap),
+            }
+        });
+
+        if self.build_panel_open && self.build_job.is_some() {
+            self.build_panel(ctx);
+        }
+        draw_window_chrome(ctx);
+
+        if can_play && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Enter)) {
+            launch_clicked = true;
+        }
+        if browse_clicked {
+            self.browse();
+        }
+        if build_clicked {
+            self.build(ctx);
+        }
+        if launch_clicked {
+            self.launch(ctx);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Rail
+
+#[derive(Clone, Copy)]
+enum NavIcon {
+    Play,
+    Notes,
+    Gear,
+}
+
+impl LauncherApp {
+    fn rail(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         egui::SidePanel::left("launcher-rail")
-            .exact_width(228.0)
+            .exact_width(RAIL_W)
             .resizable(false)
             .frame(egui::Frame::none().fill(RAIL).inner_margin(0.0))
             .show(ctx, |ui| {
                 ui.add_space(40.0);
-                let brand_width = 140.0;
                 ui.horizontal(|ui| {
-                    ui.add_space(((ui.available_width() - brand_width) * 0.5).max(0.0));
-                    ui.add(
-                        egui::Image::new((self.logo.id(), Vec2::splat(36.0)))
-                            .fit_to_exact_size(Vec2::splat(36.0)),
-                    );
-                    ui.add_space(10.0);
+                    ui.add_space(24.0);
+                    ui.add(egui::Image::new((self.logo.id(), Vec2::splat(36.0))).fit_to_exact_size(Vec2::splat(36.0)));
+                    ui.add_space(6.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("R5RUST").font(display_font(21.0)).color(TEXT));
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new("R5RUST").font(display_font(22.0)).color(TEXT));
                         ui.label(RichText::new("LAUNCHER").size(9.0).strong().color(MUTED));
                     });
                 });
-
                 ui.add_space(34.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    let nav_width = (ui.available_width() - 10.0).max(0.0);
-                    let (nav_rect, nav_response) =
-                        ui.allocate_exact_size(Vec2::new(nav_width, 44.0), Sense::click());
-                    let nav_painter = ui.painter();
-                    if nav_response.hovered() {
-                        nav_painter.rect_filled(nav_rect, Rounding::same(0.0), HOVER);
+
+                let unbuilt = snap.unbuilt.filter(|n| *n > 0).map(|n| format!("{n} NEW"));
+                for (page, label, icon, badge) in [
+                    (Page::Play, "PLAY", NavIcon::Play, None),
+                    (Page::Notes, "PATCH NOTES", NavIcon::Notes, unbuilt),
+                    (Page::Settings, "SETTINGS", NavIcon::Gear, None),
+                ] {
+                    if nav_item(ui, label, icon, self.page == page, badge.as_deref()) {
+                        self.page = page;
+                        self.mode_menu_open = false;
                     }
-                    nav_painter.rect_filled(
-                        Rect::from_min_size(nav_rect.left_top(), Vec2::new(3.0, nav_rect.height())),
-                        Rounding::same(0.0),
-                        CYAN,
-                    );
-                    let icon_center = Pos2::new(nav_rect.left() + 28.0, nav_rect.center().y);
-                    nav_painter.add(egui::Shape::convex_polygon(
-                        vec![
-                            Pos2::new(icon_center.x - 4.0, icon_center.y - 6.0),
-                            Pos2::new(icon_center.x + 6.0, icon_center.y),
-                            Pos2::new(icon_center.x - 4.0, icon_center.y + 6.0),
-                        ],
-                        CYAN,
-                        Stroke::NONE,
-                    ));
-                    nav_painter.text(
-                        Pos2::new(nav_rect.left() + 48.0, nav_rect.center().y),
-                        Align2::LEFT_CENTER,
-                        "PLAY",
-                        FontId::proportional(13.0),
-                        TEXT,
-                    );
-                    if nav_response.clicked() {
-                        select_firing_range = true;
-                    }
-                    ui.add_space(10.0);
-                });
-
-                ui.add_space((ui.available_height() - 50.0).max(24.0));
-                ui.separator();
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(24.0);
-                    ui.label(
-                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .size(11.0)
-                            .monospace()
-                            .color(MUTED),
-                    );
-                });
-            });
-
-        egui::TopBottomPanel::bottom("play-footer")
-            .exact_height(94.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(30.0, 13.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(state.footer_title())
-                                .size(11.0)
-                                .strong()
-                                .color(SECONDARY),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(self.game_root.display().to_string())
-                                .size(10.0)
-                                .monospace()
-                                .color(MUTED),
-                        );
-                        if let Some((message, is_error)) = &self.notice {
-                            ui.label(RichText::new(message).size(10.0).color(if *is_error {
-                                TEXT
-                            } else {
-                                SECONDARY
-                            }));
-                        }
-                    });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let play_button = egui::Button::new(
-                            RichText::new("PLAY")
-                                .font(display_font(24.0))
-                                .color(Color32::from_rgb(8, 19, 26)),
-                        )
-                        .fill(if state.is_ready() { CYAN } else { RAISED })
-                        .stroke(Stroke::NONE)
-                        .rounding(Rounding::same(0.0))
-                        .min_size(Vec2::new(196.0, 56.0));
-                        launch_clicked = ui.add_enabled(state.is_ready(), play_button).clicked();
-
-                        ui.add_space(12.0);
-                        let folder_name = self
-                            .game_root
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "Choose a folder".to_owned());
-                        let (folder_rect, folder_response) =
-                            ui.allocate_exact_size(Vec2::new(228.0, 56.0), Sense::click());
-                        let folder_painter = ui.painter();
-                        folder_painter.rect_filled(
-                            folder_rect,
-                            Rounding::same(0.0),
-                            if folder_response.hovered() {
-                                HOVER
-                            } else {
-                                RAISED
-                            },
-                        );
-                        folder_painter.text(
-                            Pos2::new(folder_rect.left() + 16.0, folder_rect.top() + 14.0),
-                            Align2::LEFT_TOP,
-                            "GAME FOLDER",
-                            FontId::proportional(9.0),
-                            MUTED,
-                        );
-                        folder_painter.text(
-                            Pos2::new(folder_rect.left() + 16.0, folder_rect.top() + 34.0),
-                            Align2::LEFT_TOP,
-                            folder_name,
-                            FontId::proportional(13.0),
-                            TEXT,
-                        );
-                        let chevron =
-                            Pos2::new(folder_rect.right() - 18.0, folder_rect.center().y + 1.0);
-                        folder_painter.line_segment(
-                            [Pos2::new(chevron.x - 4.0, chevron.y - 2.0), chevron],
-                            Stroke::new(1.2_f32, SECONDARY),
-                        );
-                        folder_painter.line_segment(
-                            [chevron, Pos2::new(chevron.x + 4.0, chevron.y - 2.0)],
-                            Stroke::new(1.2_f32, SECONDARY),
-                        );
-                        browse_clicked = folder_response.clicked();
-                    });
-                });
-            });
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(0.0))
-            .show(ctx, |ui| {
-                let hero_size = ui.available_size();
-                let (hero_rect, _) = ui.allocate_exact_size(hero_size, Sense::hover());
-                let painter = ui.painter();
-                painter.image(
-                    self.cover.id(),
-                    hero_rect,
-                    cover_uv(self.cover_size, hero_size),
-                    Color32::WHITE,
-                );
-
-                let top_scrim = Rect::from_min_max(
-                    hero_rect.min,
-                    Pos2::new(
-                        hero_rect.right(),
-                        hero_rect.top() + hero_rect.height() * 0.31,
-                    ),
-                );
-                paint_vertical_scrim(painter, top_scrim, 172, 0);
-
-                let bottom_scrim = Rect::from_min_max(
-                    Pos2::new(
-                        hero_rect.left(),
-                        hero_rect.top() + hero_rect.height() * 0.43,
-                    ),
-                    hero_rect.max,
-                );
-                paint_vertical_scrim(painter, bottom_scrim, 0, 226);
-
-                let left_scrim = Rect::from_min_max(
-                    hero_rect.min,
-                    Pos2::new(
-                        hero_rect.left() + hero_rect.width() * 0.50,
-                        hero_rect.bottom(),
-                    ),
-                );
-                paint_horizontal_scrim(painter, left_scrim, 142, 0);
-
-                let mode_tab = Rect::from_min_size(
-                    Pos2::new(hero_rect.left() + 40.0, hero_rect.top() + 42.0),
-                    Vec2::new(132.0, 38.0),
-                );
-                let mode_response =
-                    ui.interact(mode_tab, egui::Id::new("mode-tab"), Sense::click());
-                painter.text(
-                    Pos2::new(mode_tab.left(), mode_tab.top() + 8.0),
-                    Align2::LEFT_TOP,
-                    "MODES",
-                    FontId::new(17.0, egui::FontFamily::Name("Barlow Condensed".into())),
-                    TEXT,
-                );
-                let arrow = Pos2::new(mode_tab.left() + 78.0, mode_tab.top() + 18.0);
-                painter.line_segment(
-                    [Pos2::new(arrow.x - 4.0, arrow.y - 2.0), arrow],
-                    Stroke::new(1.3_f32, TEXT),
-                );
-                painter.line_segment(
-                    [arrow, Pos2::new(arrow.x + 4.0, arrow.y - 2.0)],
-                    Stroke::new(1.3_f32, TEXT),
-                );
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(mode_tab.left(), mode_tab.bottom() - 2.0),
-                        Vec2::new(72.0, 2.0),
-                    ),
-                    Rounding::same(0.0),
-                    CYAN,
-                );
-                mode_menu_position = Pos2::new(mode_tab.left(), mode_tab.bottom() + 10.0);
-                if mode_response.clicked() {
-                    toggle_modes_menu = true;
+                    ui.add_space(2.0);
                 }
 
-                painter.text(
-                    Pos2::new(hero_rect.right() - 36.0, hero_rect.top() + 55.0),
-                    Align2::RIGHT_CENTER,
-                    state.status_label(),
-                    FontId::proportional(10.0),
-                    SECONDARY,
-                );
+                ui.add_space((ui.available_height() - 66.0).max(24.0));
+                let line = ui.cursor().min.y;
+                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(1.0_f32, BORDER));
+                ui.add_space(16.0);
+                let build = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("none");
+                for (key, value) in [("GAME", build.to_owned()), ("LAUNCHER", format!("v{}", env!("CARGO_PKG_VERSION")))]
+                {
+                    ui.horizontal(|ui| {
+                        ui.add_space(24.0);
+                        ui.label(RichText::new(key).size(9.0).strong().color(MUTED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(24.0);
+                            ui.label(RichText::new(value).size(11.0).monospace().color(SECONDARY));
+                        });
+                    });
+                }
+            });
+    }
+}
 
-                let title_x = hero_rect.left() + 42.0;
-                let title_y = hero_rect.bottom() - 168.0;
-                painter.text(
-                    Pos2::new(title_x, title_y),
-                    Align2::LEFT_TOP,
-                    "TRAINING MODE",
-                    FontId::proportional(11.0),
-                    CYAN,
-                );
-                painter.text(
-                    Pos2::new(title_x - 2.0, title_y + 15.0),
-                    Align2::LEFT_TOP,
-                    self.selected_mode.title().to_uppercase(),
-                    display_font(68.0),
-                    TEXT,
-                );
-                painter.text(
-                    Pos2::new(title_x + 2.0, title_y + 91.0),
-                    Align2::LEFT_TOP,
-                    "Move freely. Practice your movement. Make the range yours.",
-                    FontId::proportional(14.0),
-                    SECONDARY,
-                );
-                painter.text(
-                    Pos2::new(title_x + 2.0, title_y + 117.0),
-                    Align2::LEFT_TOP,
-                    "LOCAL SESSION   /   SOLO",
-                    FontId::monospace(10.0),
-                    MUTED,
-                );
+fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, active: bool, badge: Option<&str>) -> bool {
+    let width = ui.available_width() - 20.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
+    let rect = Rect::from_min_size(rect.min + Vec2::new(10.0, 0.0), Vec2::new(width, 44.0));
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, Rounding::same(0.0), RAISED);
+        painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), Rounding::same(0.0), CYAN);
+    } else if response.hovered() {
+        painter.rect_filled(rect, Rounding::same(0.0), HOVER);
+    }
+    let color = if active { CYAN } else if response.hovered() { TEXT } else { SECONDARY };
+    let c = Pos2::new(rect.left() + 28.0, rect.center().y);
+    let stroke = Stroke::new(1.5_f32, color);
+    match icon {
+        NavIcon::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![Pos2::new(c.x - 4.0, c.y - 6.0), Pos2::new(c.x + 6.0, c.y), Pos2::new(c.x - 4.0, c.y + 6.0)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        NavIcon::Notes => {
+            for (dy, w) in [(-5.0, 12.0), (0.0, 12.0), (5.0, 8.0)] {
+                painter.line_segment([Pos2::new(c.x - 6.0, c.y + dy), Pos2::new(c.x - 6.0 + w, c.y + dy)], stroke);
+            }
+        }
+        NavIcon::Gear => {
+            painter.circle_stroke(c, 3.2, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let d = Vec2::new(a.cos(), a.sin());
+                painter.line_segment([c + d * 5.0, c + d * 7.0], Stroke::new(2.0_f32, color));
+            }
+        }
+    }
+    painter.text(
+        Pos2::new(rect.left() + 48.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        if active || response.hovered() { TEXT } else { SECONDARY },
+    );
+    if let Some(badge) = badge {
+        painter.text(
+            Pos2::new(rect.right() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            badge,
+            FontId::proportional(9.0),
+            CYAN,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Footer: what's installed, what's pending, and the two actions.
+
+impl LauncherApp {
+    fn footer(
+        &self,
+        ui: &mut egui::Ui,
+        snap: &Snapshot,
+        phase: PlayPhase,
+        can_play: bool,
+        can_build: bool,
+    ) -> (bool, bool) {
+        let mut play = false;
+        let mut build = false;
+        let left_w = (ui.available_width() - 196.0 - 200.0 - 48.0).max(200.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(left_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(left_w);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let title = match snap.state {
+                    GameState::Ready if snap.current.is_some() => "INSTALLED BUILD",
+                    GameState::Ready => "STAGED BUILD",
+                    GameState::NoBuild => "NO BUILD YET",
+                    GameState::FolderMissing | GameState::InvalidFolder => "SETUP REQUIRED",
+                };
+                ui.label(RichText::new(title).size(10.0).strong().color(MUTED));
+
+                match (snap.state, snap.current.as_ref().or(snap.next.as_ref())) {
+                    (GameState::Ready, Some(build)) => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&build.hash).monospace().size(13.0).color(CYAN));
+                            ui.add(
+                                egui::Label::new(RichText::new(&build.subject).size(13.0).color(TEXT)).truncate(),
+                            );
+                        });
+                    }
+                    (GameState::Ready, None) => {
+                        ui.label(RichText::new("A build is staged (no version info).").size(13.0).color(TEXT));
+                    }
+                    (GameState::NoBuild, _) => {
+                        ui.label(RichText::new("Press Build latest to compile the game.").size(13.0).color(TEXT));
+                    }
+                    (GameState::FolderMissing, _) => {
+                        ui.label(RichText::new("The game folder doesn't exist. Pick it in Settings.").size(13.0).color(TEXT));
+                    }
+                    (GameState::InvalidFolder, _) => {
+                        ui.label(RichText::new("That folder has no play.ps1. Pick the r5rust folder in Settings.").size(13.0).color(TEXT));
+                    }
+                }
+
+                let (line, tone) = if let Some((text, tone)) = &self.notice {
+                    (text.clone(), *tone)
+                } else if phase == PlayPhase::Running {
+                    ("R5Rust is running.".to_owned(), Tone::Good)
+                } else if let (Some(next), Some(_)) = (&snap.next, &snap.current) {
+                    (format!("Update {} staged. It installs when you press Play.", next.hash), Tone::Good)
+                } else if let Some(n) = snap.unbuilt.filter(|n| *n > 0) {
+                    (format!("{n} newer commit{} not built yet.", if n == 1 { "" } else { "s" }), Tone::Info)
+                } else if let Some(b) = snap.newest() {
+                    (format!("Up to date with the game's code. Built {}.", b.date), Tone::Info)
+                } else {
+                    (String::new(), Tone::Info)
+                };
+                let color = if tone == Tone::Info { MUTED } else { tone.color() };
+                ui.add(egui::Label::new(RichText::new(line).size(11.0).color(color)).truncate());
             });
 
-        if toggle_modes_menu {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, fill, text) = match phase {
+                    PlayPhase::Running => ("RUNNING", RAISED, CYAN),
+                    PlayPhase::Starting => ("STARTING", RAISED, SECONDARY),
+                    PlayPhase::Idle if can_play => ("PLAY", CYAN, INK),
+                    PlayPhase::Idle => ("PLAY", RAISED, MUTED),
+                };
+                let button = egui::Button::new(RichText::new(label).font(display_font(26.0)).color(text))
+                    .fill(fill)
+                    .stroke(Stroke::NONE)
+                    .rounding(Rounding::same(0.0))
+                    .min_size(Vec2::new(196.0, 56.0));
+                let response = ui.add_enabled(can_play, button);
+                if phase == PlayPhase::Starting {
+                    paint_progress_line(ui, response.rect, CYAN);
+                }
+                play = response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                ui.add_space(12.0);
+                build = self.build_button(ui, snap, can_build);
+            });
+        });
+        (play, build)
+    }
+
+    fn build_button(&self, ui: &mut egui::Ui, snap: &Snapshot, enabled: bool) -> bool {
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(200.0, 56.0), Sense::click());
+        let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
+        let painter = ui.painter();
+        let hovered = enabled && response.hovered();
+        let pending = snap.unbuilt.is_some_and(|n| n > 0) || snap.state == GameState::NoBuild;
+        painter.rect_filled(rect, Rounding::same(0.0), if hovered { HOVER } else { RAISED });
+        if pending && enabled {
+            painter.rect_stroke(rect.shrink(0.5), Rounding::same(0.0), Stroke::new(1.0_f32, CYAN.gamma_multiply(0.6)));
+        }
+        let (title, detail, detail_color) = if let Some(job) = self.build_job.as_ref().filter(|j| j.running()) {
+            ("BUILDING", format!("cargo build  {}", fmt_duration(job.elapsed())), CYAN)
+        } else if snap.state == GameState::NoBuild {
+            ("BUILD LATEST", "no build yet".to_owned(), AMBER)
+        } else {
+            match snap.unbuilt {
+                Some(0) => ("BUILD LATEST", "up to date".to_owned(), MUTED),
+                Some(n) => ("BUILD LATEST", format!("{n} new commit{}", if n == 1 { "" } else { "s" }), CYAN),
+                None => ("BUILD LATEST", "compile + stage".to_owned(), MUTED),
+            }
+        };
+        let title_color = if enabled || self.building() { TEXT } else { MUTED };
+        painter.text(rect.left_top() + Vec2::new(16.0, 12.0), Align2::LEFT_TOP, title, display_font(17.0), title_color);
+        painter.text(
+            rect.left_top() + Vec2::new(16.0, 33.0),
+            Align2::LEFT_TOP,
+            detail,
+            FontId::proportional(10.0),
+            detail_color,
+        );
+        if self.building() {
+            paint_progress_line(ui, rect, CYAN);
+        }
+        enabled && response.clicked()
+    }
+}
+
+/// An indeterminate progress sweep along the bottom edge of `rect`.
+fn paint_progress_line(ui: &egui::Ui, rect: Rect, color: Color32) {
+    let t = ui.input(|i| i.time) as f32;
+    let span = rect.width() * 0.3;
+    let x = rect.left() - span + (t * 0.8).fract() * (rect.width() + span);
+    let bar = Rect::from_min_max(
+        Pos2::new(x.max(rect.left()), rect.bottom() - 2.0),
+        Pos2::new((x + span).min(rect.right()), rect.bottom()),
+    );
+    ui.painter().rect_filled(bar, Rounding::same(0.0), color);
+    ui.ctx().request_repaint_after(Duration::from_millis(16));
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Play page
+
+impl LauncherApp {
+    fn play_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, phase: PlayPhase) {
+        let hero_size = ui.available_size();
+        let (hero, _) = ui.allocate_exact_size(hero_size, Sense::hover());
+        let painter = ui.painter().clone();
+        painter.image(self.cover.id(), hero, cover_uv(self.cover_size, hero_size), Color32::WHITE);
+        paint_vertical_scrim(
+            &painter,
+            Rect::from_min_max(hero.min, Pos2::new(hero.right(), hero.top() + hero.height() * 0.31)),
+            172,
+            0,
+        );
+        paint_vertical_scrim(
+            &painter,
+            Rect::from_min_max(Pos2::new(hero.left(), hero.top() + hero.height() * 0.43), hero.max),
+            0,
+            226,
+        );
+        paint_horizontal_scrim(
+            &painter,
+            Rect::from_min_max(hero.min, Pos2::new(hero.left() + hero.width() * 0.5, hero.bottom())),
+            142,
+            0,
+        );
+
+        // MODES tab + menu
+        let tab = Rect::from_min_size(Pos2::new(hero.left() + 40.0, hero.top() + 42.0), Vec2::new(132.0, 38.0));
+        let tab_response = ui.interact(tab, egui::Id::new("mode-tab"), Sense::click());
+        let tab_color = if tab_response.hovered() || self.mode_menu_open { TEXT } else { SECONDARY };
+        painter.text(Pos2::new(tab.left(), tab.top() + 8.0), Align2::LEFT_TOP, "MODES", display_font(17.0), tab_color);
+        let arrow = Pos2::new(tab.left() + 58.0, tab.top() + 18.0);
+        let flip = if self.mode_menu_open { -1.0 } else { 1.0 };
+        painter.line_segment([Pos2::new(arrow.x - 4.0, arrow.y - 2.0 * flip), arrow], Stroke::new(1.3_f32, tab_color));
+        painter.line_segment([arrow, Pos2::new(arrow.x + 4.0, arrow.y - 2.0 * flip)], Stroke::new(1.3_f32, tab_color));
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(tab.left(), tab.bottom() - 2.0), Vec2::new(72.0, 2.0)),
+            Rounding::same(0.0),
+            CYAN,
+        );
+        let toggled = tab_response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+        if toggled {
             self.mode_menu_open = !self.mode_menu_open;
         }
 
-        let mut choose_mode = false;
+        // Title block
+        let x = hero.left() + 42.0;
+        let y = hero.bottom() - 168.0;
+        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "TRAINING MODE", FontId::proportional(11.0), CYAN);
+        painter.text(Pos2::new(x - 2.0, y + 15.0), Align2::LEFT_TOP, "FIRING RANGE", display_font(68.0), TEXT);
+        painter.text(
+            Pos2::new(x + 2.0, y + 91.0),
+            Align2::LEFT_TOP,
+            "Move freely. Practice your movement. Make the range yours.",
+            FontId::proportional(14.0),
+            SECONDARY,
+        );
+        let meta = painter.text(
+            Pos2::new(x + 2.0, y + 117.0),
+            Align2::LEFT_TOP,
+            "LOCAL SESSION   /   SOLO",
+            FontId::monospace(10.0),
+            MUTED,
+        );
+        if phase != PlayPhase::Idle {
+            let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) as f32 * 3.0).sin().abs();
+            let dot = Pos2::new(meta.right() + 22.0, meta.center().y);
+            painter.circle_filled(dot, 3.5, CYAN.gamma_multiply(pulse));
+            let text = match (phase, self.play_job.as_ref()) {
+                (PlayPhase::Starting, _) => "STARTING".to_owned(),
+                (_, Some(job)) => format!("IN GAME  {}", fmt_duration(job.elapsed())),
+                _ => "IN GAME".to_owned(),
+            };
+            painter.text(dot + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, text, FontId::monospace(10.0), CYAN);
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
         if self.mode_menu_open {
-            egui::Area::new(egui::Id::new("mode-menu"))
+            let area = egui::Area::new(egui::Id::new("mode-menu"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(mode_menu_position)
-                .show(ctx, |ui| {
-                    egui::Frame::none()
-                        .fill(PANEL)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_width(312.0);
-                            ui.label(RichText::new("GAME MODES").size(10.0).strong().color(MUTED));
-                            ui.add_space(8.0);
+                .fixed_pos(Pos2::new(tab.left(), tab.bottom() + 10.0))
+                .show(ctx, |ui| self.mode_menu(ui));
+            if area.inner || (!toggled && area.response.clicked_elsewhere()) {
+                self.mode_menu_open = false;
+            }
+        }
+    }
 
-                            let (row_rect, row_response) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 74.0),
-                                Sense::click(),
-                            );
-                            let menu_painter = ui.painter();
-                            menu_painter.rect_filled(
-                                row_rect,
-                                Rounding::same(0.0),
-                                if row_response.hovered() {
-                                    HOVER
-                                } else {
-                                    RAISED
-                                },
-                            );
-                            menu_painter.rect_filled(
-                                Rect::from_min_size(
-                                    row_rect.left_top(),
-                                    Vec2::new(2.0, row_rect.height()),
-                                ),
-                                Rounding::same(0.0),
-                                CYAN,
-                            );
-                            let thumb_rect = Rect::from_min_size(
-                                row_rect.left_top() + Vec2::new(10.0, 9.0),
-                                Vec2::new(88.0, 56.0),
-                            );
-                            menu_painter.image(
-                                self.cover.id(),
-                                thumb_rect,
-                                cover_uv(self.cover_size, thumb_rect.size()),
-                                Color32::WHITE,
-                            );
-                            menu_painter.text(
-                                Pos2::new(thumb_rect.right() + 12.0, row_rect.top() + 23.0),
-                                Align2::LEFT_TOP,
-                                "Firing Range",
-                                FontId::proportional(13.0),
-                                TEXT,
-                            );
-                            menu_painter.text(
-                                Pos2::new(thumb_rect.right() + 12.0, row_rect.top() + 45.0),
-                                Align2::LEFT_TOP,
-                                "AVAILABLE",
-                                FontId::proportional(9.0),
-                                SECONDARY,
-                            );
-                            if row_response.clicked() {
-                                choose_mode = true;
-                            }
+    /// Returns true when the menu should close (a mode was picked).
+    fn mode_menu(&self, ui: &mut egui::Ui) -> bool {
+        let mut picked = false;
+        egui::Frame::none().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).inner_margin(12.0).show(ui, |ui| {
+            ui.set_width(312.0);
+            ui.label(RichText::new("GAME MODES").size(10.0).strong().color(MUTED));
+            ui.add_space(8.0);
+            let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 74.0), Sense::click());
+            let p = ui.painter();
+            p.rect_filled(row, Rounding::same(0.0), if response.hovered() { HOVER } else { RAISED });
+            p.rect_filled(Rect::from_min_size(row.left_top(), Vec2::new(2.0, row.height())), Rounding::same(0.0), CYAN);
+            let thumb = Rect::from_min_size(row.left_top() + Vec2::new(10.0, 9.0), Vec2::new(88.0, 56.0));
+            p.image(self.cover.id(), thumb, cover_uv(self.cover_size, thumb.size()), Color32::WHITE);
+            p.text(Pos2::new(thumb.right() + 12.0, row.top() + 23.0), Align2::LEFT_TOP, "Firing Range", FontId::proportional(13.0), TEXT);
+            p.text(Pos2::new(thumb.right() + 12.0, row.top() + 45.0), Align2::LEFT_TOP, "SELECTED", FontId::proportional(9.0), CYAN);
+            picked = response.clicked();
+            ui.add_space(9.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new("MORE MODES").size(9.0).strong().color(MUTED));
+            ui.label(RichText::new("Coming later").size(11.0).color(SECONDARY));
+        });
+        picked
+    }
 
-                            ui.add_space(9.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("MORE MODES").size(9.0).strong().color(MUTED));
-                            ui.label(RichText::new("Coming later").size(11.0).color(SECONDARY));
-                        });
-                });
-        }
+    fn build_panel(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.build_job else { return };
+        let screen = ctx.screen_rect();
+        let size = Vec2::new(560.0_f32.min(screen.width() - RAIL_W - 56.0), 240.0);
+        let pos = Pos2::new(screen.right() - 28.0 - size.x, screen.bottom() - FOOTER_H - 20.0 - size.y);
+        let mut close = false;
+        let mut open_log = false;
+        egui::Area::new(egui::Id::new("build-panel")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, Rounding::same(0.0), Color32::from_rgba_unmultiplied(9, 13, 18, 238));
+            p.rect_stroke(rect, Rounding::same(0.0), Stroke::new(1.0_f32, BORDER));
+            let (status, color) = match job.exit {
+                None => (format!("COMPILING  {}", fmt_duration(job.elapsed())), CYAN),
+                Some(Some(0)) => (format!("STAGED IN {}", fmt_duration(job.elapsed())), CYAN),
+                Some(_) => ("FAILED".to_owned(), RED),
+            };
+            p.text(rect.left_top() + Vec2::new(16.0, 14.0), Align2::LEFT_TOP, "BUILD", display_font(17.0), TEXT);
+            p.text(rect.left_top() + Vec2::new(62.0, 17.0), Align2::LEFT_TOP, status, FontId::monospace(11.0), color);
 
-        if choose_mode {
-            select_firing_range = true;
-            self.mode_menu_open = false;
+            let close_rect = Rect::from_min_size(Pos2::new(rect.right() - 36.0, rect.top() + 6.0), Vec2::splat(30.0));
+            let close_r = ui.interact(close_rect, egui::Id::new("build-close"), Sense::click());
+            if close_r.hovered() {
+                p.rect_filled(close_rect, Rounding::same(0.0), HOVER);
+            }
+            let c = close_rect.center();
+            let s = Stroke::new(1.2_f32, if job.running() { MUTED } else { TEXT });
+            p.line_segment([c + Vec2::new(-4.5, -4.5), c + Vec2::new(4.5, 4.5)], s);
+            p.line_segment([c + Vec2::new(4.5, -4.5), c + Vec2::new(-4.5, 4.5)], s);
+            close = close_r.clicked();
+
+            let log_rect = Rect::from_min_size(Pos2::new(close_rect.left() - 76.0, rect.top() + 6.0), Vec2::new(70.0, 30.0));
+            let log_r = ui.interact(log_rect, egui::Id::new("build-log"), Sense::click());
+            p.text(log_rect.center(), Align2::CENTER_CENTER, "OPEN LOG", FontId::proportional(10.0), if log_r.hovered() { TEXT } else { SECONDARY });
+            open_log = log_r.clicked();
+
+            let body = Rect::from_min_max(rect.left_top() + Vec2::new(16.0, 44.0), rect.right_bottom() - Vec2::new(16.0, 12.0));
+            let clipped = p.with_clip_rect(body);
+            let lines = job.tail(12);
+            let line_h = 15.0;
+            let start = body.bottom() - line_h * lines.len() as f32;
+            for (i, line) in lines.iter().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                let color = if lower.starts_with("error") || lower.contains("failed") {
+                    RED
+                } else if lower.starts_with("warning") {
+                    AMBER
+                } else if lower.starts_with("staged:") || lower.contains("finished") {
+                    CYAN
+                } else {
+                    SECONDARY
+                };
+                clipped.text(
+                    Pos2::new(body.left(), start.max(body.top()) + i as f32 * line_h),
+                    Align2::LEFT_TOP,
+                    line.trim_end(),
+                    FontId::monospace(11.0),
+                    color,
+                );
+            }
+            if job.running() {
+                paint_progress_line(ui, Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), 2.0)), CYAN);
+            }
+        });
+        if open_log {
+            let _ = game::open_path(&job.log_path);
         }
-        if select_firing_range {
-            self.selected_mode = GameMode::FiringRange;
-        }
-        draw_window_chrome(ctx);
-        if browse_clicked {
-            self.browse();
-        }
-        if launch_clicked {
-            self.launch();
+        if close {
+            self.build_panel_open = false;
+            if !self.building() {
+                self.build_job = None;
+            }
         }
     }
 }
+
+// -------------------------------------------------------------------------------------------------------------------
+// Patch notes: the game's git history, with the installed and staged builds marked.
+
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.label(RichText::new(title).font(display_font(46.0)).color(TEXT));
+    ui.add_space(2.0);
+    ui.label(RichText::new(subtitle).size(13.0).color(SECONDARY));
+    ui.add_space(22.0);
+}
+
+fn chip(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(9.0), color);
+    let size = galley.size() + Vec2::new(14.0, 8.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if filled {
+        ui.painter().rect_filled(rect, Rounding::same(0.0), color);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(9.0), INK);
+    } else {
+        ui.painter().rect_stroke(rect.shrink(0.5), Rounding::same(0.0), Stroke::new(1.0_f32, color));
+        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+}
+
+fn same_hash(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
+}
+
+impl LauncherApp {
+    fn notes_page(&self, ui: &mut egui::Ui, snap: &Snapshot) {
+        egui::Frame::none().inner_margin(Margin { left: 48.0, right: 48.0, top: 58.0, bottom: 0.0 }).show(ui, |ui| {
+            let subtitle = match snap.unbuilt {
+                Some(0) => "Recent changes to the game. Your build has all of them.".to_owned(),
+                Some(1) => "Recent changes to the game. The newest one isn't in a build yet: use Build latest.".to_owned(),
+                Some(n) => format!("Recent changes to the game. The newest {n} aren't in a build yet: use Build latest."),
+                None => "Recent changes to the game, from its git history.".to_owned(),
+            };
+            page_header(ui, "PATCH NOTES", &subtitle);
+            if snap.commits.is_empty() {
+                ui.label(RichText::new("No git history in this game folder.").size(13.0).color(MUTED));
+                return;
+            }
+            let playing = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("");
+            let staged = snap.next.as_ref().map(|b| b.hash.as_str()).unwrap_or("");
+            let unbuilt = snap.unbuilt.unwrap_or(0) as usize;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width() - 8.0);
+                let mut day = "";
+                for (i, c) in snap.commits.iter().enumerate() {
+                    if c.day != day {
+                        day = &c.day;
+                        ui.add_space(if i == 0 { 0.0 } else { 18.0 });
+                        ui.label(RichText::new(&c.day).size(10.0).strong().color(MUTED));
+                        ui.add_space(4.0);
+                    }
+                    let row_top = ui.cursor().min.y;
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(2.0);
+                        ui.allocate_ui_with_layout(Vec2::new(64.0, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                            ui.set_width(64.0);
+                            ui.label(RichText::new(&c.hash).monospace().size(12.0).color(MUTED));
+                        });
+                        let chips_w = 230.0;
+                        let text_w = (ui.available_width() - chips_w).max(200.0);
+                        ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                            ui.set_width(text_w);
+                            ui.add(egui::Label::new(RichText::new(&c.subject).size(13.0).color(TEXT)).wrap());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            ui.label(RichText::new(format!("{}  {}", c.time, c.ago)).size(10.0).color(MUTED));
+                            ui.add_space(6.0);
+                            if same_hash(&c.hash, playing) {
+                                chip(ui, "PLAYING", CYAN, true);
+                            }
+                            if same_hash(&c.hash, staged) {
+                                chip(ui, "STAGED", CYAN, false);
+                            }
+                            if i < unbuilt {
+                                chip(ui, "NOT BUILT", MUTED, false);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    let y = ui.cursor().min.y - 4.0;
+                    if y > row_top {
+                        ui.painter().hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, BORDER));
+                    }
+                }
+                ui.add_space(24.0);
+            });
+        });
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Settings
+
+fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.label(RichText::new(title).size(10.0).strong().color(MUTED));
+    ui.add_space(6.0);
+    egui::Frame::none().fill(PANEL).inner_margin(Margin::same(20.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        body(ui);
+    });
+    ui.add_space(22.0);
+}
+
+fn flat_button(ui: &mut egui::Ui, text: &str) -> bool {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.0).strong().color(TEXT))
+            .fill(RAISED)
+            .stroke(Stroke::NONE)
+            .rounding(Rounding::same(0.0))
+            .min_size(Vec2::new(0.0, 34.0)),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .clicked()
+}
+
+impl LauncherApp {
+    /// Returns true when "Change folder" was pressed (the dialog runs after the frame).
+    fn settings_page(&mut self, ui: &mut egui::Ui, snap: &Snapshot) -> bool {
+        let mut browse = false;
+        let mut open_err = None;
+        egui::Frame::none().inner_margin(Margin { left: 48.0, right: 48.0, top: 58.0, bottom: 0.0 }).show(ui, |ui| {
+            page_header(ui, "SETTINGS", "Where the game lives and how it starts.");
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_max_width(760.0);
+                section(ui, "GAME FOLDER", |ui| {
+                    ui.label(RichText::new(self.game_root.display().to_string()).monospace().size(13.0).color(TEXT));
+                    let (state, color) = match snap.state {
+                        GameState::Ready => ("R5Rust project with a build ready to play", CYAN),
+                        GameState::NoBuild => ("R5Rust project, nothing built yet", AMBER),
+                        GameState::FolderMissing => ("This folder doesn't exist", RED),
+                        GameState::InvalidFolder => ("Not an R5Rust project (no play.ps1)", RED),
+                    };
+                    ui.label(RichText::new(state).size(11.0).color(color));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        browse = flat_button(ui, "CHANGE FOLDER");
+                        if flat_button(ui, "OPEN FOLDER") {
+                            open_err = game::open_path(&self.game_root).err();
+                        }
+                    });
+                });
+                section(ui, "LAUNCH OPTIONS", |ui| {
+                    let edit = egui::TextEdit::singleline(&mut self.launch_args)
+                        .hint_text(RichText::new("e.g. --fly --fov 110").color(MUTED))
+                        .font(FontId::monospace(13.0))
+                        .margin(Margin::symmetric(10.0, 9.0))
+                        .desired_width(f32::INFINITY);
+                    if ui.add(edit).changed()
+                        && let Err(e) = game::write_setting("launch_args.txt", &self.launch_args)
+                    {
+                        open_err = Some(format!("Couldn't save launch options: {e}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Added to every launch. Game flags:").size(11.0).color(SECONDARY));
+                    ui.add_space(2.0);
+                    for (flag, what) in [
+                        ("--fly", "free-fly camera, no collision"),
+                        ("--fov <deg>", "field of view for this run"),
+                        ("--pos x,y,z", "spawn at a map position (feet)"),
+                        ("--yaw <deg>  --pitch <deg>", "spawn view angles"),
+                        ("--menu", "open the in-game menu at start"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(Vec2::new(190.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
+                                ui.set_width(190.0);
+                                ui.label(RichText::new(flag).monospace().size(11.0).color(TEXT));
+                            });
+                            ui.label(RichText::new(what).size(11.0).color(MUTED));
+                        });
+                    }
+                });
+                section(ui, "FILES", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if flat_button(ui, "GAME SETTINGS FILE") {
+                            open_err = game::open_path(&self.game_root.join("r5rust_settings.toml")).err();
+                        }
+                        let dir = game::data_dir().unwrap_or_default();
+                        if flat_button(ui, "LAST GAME LOG") {
+                            open_err = game::open_path(&dir.join("game.log")).err();
+                        }
+                        if flat_button(ui, "LAST BUILD LOG") {
+                            open_err = game::open_path(&dir.join("build.log")).err();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Keybinds, sensitivity and FOV are also in the game's own menu (Esc).")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                });
+                section(ui, "ABOUT", |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "R5Rust Launcher v{}. Play runs play.ps1, which installs a staged build first. Build latest runs tools\\publish.ps1 (cargo build + stage); it never touches the copy you're playing.",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(12.0)
+                        .color(SECONDARY),
+                    );
+                });
+            });
+        });
+        if let Some(e) = open_err {
+            self.notice = Some((e, Tone::Bad));
+        }
+        browse
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Window chrome and painting helpers
 
 fn draw_window_chrome(ctx: &egui::Context) {
     let screen = ctx.screen_rect();
@@ -558,24 +963,11 @@ fn draw_window_chrome(ctx: &egui::Context) {
         .default_size(bar_size)
         .show(ctx, |ui| {
             let (bar, _) = ui.allocate_exact_size(bar_size, Sense::hover());
-            let close = Rect::from_min_size(
-                Pos2::new(bar.right() - 40.0, bar.top() + 3.0),
-                Vec2::new(36.0, 30.0),
-            );
-            let maximize = Rect::from_min_size(
-                Pos2::new(close.left() - 38.0, bar.top() + 3.0),
-                Vec2::new(36.0, 30.0),
-            );
-            let minimize = Rect::from_min_size(
-                Pos2::new(maximize.left() - 38.0, bar.top() + 3.0),
-                Vec2::new(36.0, 30.0),
-            );
+            let close = Rect::from_min_size(Pos2::new(bar.right() - 40.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
+            let maximize = Rect::from_min_size(Pos2::new(close.left() - 38.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
+            let minimize = Rect::from_min_size(Pos2::new(maximize.left() - 38.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
             let drag_area = Rect::from_min_max(bar.min, Pos2::new(minimize.left(), bar.bottom()));
-            let drag = ui.interact(
-                drag_area,
-                egui::Id::new("window-drag-area"),
-                Sense::click_and_drag(),
-            );
+            let drag = ui.interact(drag_area, egui::Id::new("window-drag-area"), Sense::click_and_drag());
             if drag.drag_started() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
@@ -583,82 +975,53 @@ fn draw_window_chrome(ctx: &egui::Context) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
 
-            let minimize_response =
-                ui.interact(minimize, egui::Id::new("window-minimize"), Sense::click());
-            let maximize_response =
-                ui.interact(maximize, egui::Id::new("window-maximize"), Sense::click());
-            let close_response = ui.interact(close, egui::Id::new("window-close"), Sense::click());
+            let min_r = ui.interact(minimize, egui::Id::new("window-minimize"), Sense::click());
+            let max_r = ui.interact(maximize, egui::Id::new("window-maximize"), Sense::click());
+            let close_r = ui.interact(close, egui::Id::new("window-close"), Sense::click());
             let painter = ui.painter();
-
-            if minimize_response.hovered() {
+            if min_r.hovered() {
                 painter.rect_filled(minimize, Rounding::same(0.0), HOVER);
             }
-            if maximize_response.hovered() {
+            if max_r.hovered() {
                 painter.rect_filled(maximize, Rounding::same(0.0), HOVER);
             }
-            if close_response.hovered() {
+            if close_r.hovered() {
                 painter.rect_filled(close, Rounding::same(0.0), Color32::from_rgb(224, 68, 58));
             }
+            let s = Stroke::new(1.2_f32, TEXT);
+            let m = minimize.center();
+            painter.line_segment([Pos2::new(m.x - 5.0, m.y + 3.0), Pos2::new(m.x + 5.0, m.y + 3.0)], s);
+            painter.rect_stroke(maximize.shrink(10.0), Rounding::same(0.0), s);
+            let c = close.center();
+            painter.line_segment([Pos2::new(c.x - 5.0, c.y - 5.0), Pos2::new(c.x + 5.0, c.y + 5.0)], s);
+            painter.line_segment([Pos2::new(c.x + 5.0, c.y - 5.0), Pos2::new(c.x - 5.0, c.y + 5.0)], s);
 
-            let icon_stroke = Stroke::new(1.2_f32, TEXT);
-            painter.line_segment(
-                [
-                    Pos2::new(minimize.center().x - 5.0, minimize.center().y + 3.0),
-                    Pos2::new(minimize.center().x + 5.0, minimize.center().y + 3.0),
-                ],
-                icon_stroke,
-            );
-            let max_icon = maximize.shrink(10.0);
-            painter.rect_stroke(max_icon, Rounding::same(0.0), icon_stroke);
-            let close_center = close.center();
-            painter.line_segment(
-                [
-                    Pos2::new(close_center.x - 5.0, close_center.y - 5.0),
-                    Pos2::new(close_center.x + 5.0, close_center.y + 5.0),
-                ],
-                icon_stroke,
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(close_center.x + 5.0, close_center.y - 5.0),
-                    Pos2::new(close_center.x - 5.0, close_center.y + 5.0),
-                ],
-                icon_stroke,
-            );
-
-            if minimize_response.clicked() {
+            if min_r.clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if maximize_response.clicked() {
+            if max_r.clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
-            if close_response.clicked() {
+            if close_r.clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
 }
 
 fn paint_vertical_scrim(painter: &egui::Painter, bounds: Rect, top_alpha: u8, bottom_alpha: u8) {
-    let mut mesh = egui::Mesh::default();
-    let top = Color32::from_black_alpha(top_alpha);
-    let bottom = Color32::from_black_alpha(bottom_alpha);
-    mesh.colored_vertex(bounds.left_top(), top);
-    mesh.colored_vertex(bounds.right_top(), top);
-    mesh.colored_vertex(bounds.right_bottom(), bottom);
-    mesh.colored_vertex(bounds.left_bottom(), bottom);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    painter.add(egui::Shape::mesh(mesh));
+    paint_scrim(painter, bounds, [top_alpha, top_alpha, bottom_alpha, bottom_alpha]);
 }
 
 fn paint_horizontal_scrim(painter: &egui::Painter, bounds: Rect, left_alpha: u8, right_alpha: u8) {
+    paint_scrim(painter, bounds, [left_alpha, right_alpha, right_alpha, left_alpha]);
+}
+
+/// Alphas for the corners top-left, top-right, bottom-right, bottom-left.
+fn paint_scrim(painter: &egui::Painter, b: Rect, a: [u8; 4]) {
     let mut mesh = egui::Mesh::default();
-    let left = Color32::from_black_alpha(left_alpha);
-    let right = Color32::from_black_alpha(right_alpha);
-    mesh.colored_vertex(bounds.left_top(), left);
-    mesh.colored_vertex(bounds.right_top(), right);
-    mesh.colored_vertex(bounds.right_bottom(), right);
-    mesh.colored_vertex(bounds.left_bottom(), left);
+    for (pos, alpha) in [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()].into_iter().zip(a) {
+        mesh.colored_vertex(pos, Color32::from_black_alpha(alpha));
+    }
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(egui::Shape::mesh(mesh));
@@ -668,131 +1031,12 @@ fn cover_uv(image_size: Vec2, target_size: Vec2) -> Rect {
     let image_aspect = image_size.x / image_size.y;
     let target_aspect = target_size.x / target_size.y;
     if image_aspect > target_aspect {
-        let visible_width = target_aspect / image_aspect;
-        let crop = (1.0 - visible_width) * 0.5;
+        let crop = (1.0 - target_aspect / image_aspect) * 0.5;
         Rect::from_min_max(Pos2::new(crop, 0.0), Pos2::new(1.0 - crop, 1.0))
     } else {
-        let visible_height = image_aspect / target_aspect;
-        let crop = (1.0 - visible_height) * 0.5;
+        let crop = (1.0 - image_aspect / target_aspect) * 0.5;
         Rect::from_min_max(Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GameMode {
-    FiringRange,
-}
-
-impl GameMode {
-    fn title(self) -> &'static str {
-        match self {
-            Self::FiringRange => "Firing Range",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GameState {
-    Ready { update_waiting: bool },
-    FolderMissing,
-    InvalidFolder,
-    NoBuild,
-}
-
-impl GameState {
-    fn is_ready(self) -> bool {
-        matches!(self, Self::Ready { .. })
-    }
-
-    fn status_label(self) -> &'static str {
-        match self {
-            Self::Ready {
-                update_waiting: true,
-            } => "UPDATE STAGED",
-            Self::Ready {
-                update_waiting: false,
-            } => "GAME BUILD READY",
-            Self::FolderMissing => "FOLDER NOT FOUND",
-            Self::InvalidFolder => "NOT AN R5RUST FOLDER",
-            Self::NoBuild => "NO STAGED BUILD",
-        }
-    }
-
-    fn footer_title(self) -> &'static str {
-        match self {
-            Self::Ready { .. } => "READY TO PLAY",
-            Self::FolderMissing | Self::InvalidFolder | Self::NoBuild => "SETUP REQUIRED",
-        }
-    }
-}
-
-fn inspect_game(root: &Path) -> GameState {
-    if !root.is_dir() {
-        return GameState::FolderMissing;
-    }
-    if !root.join("play.ps1").is_file() {
-        return GameState::InvalidFolder;
-    }
-
-    let current_build = root.join("play/current/r5rust.exe").is_file();
-    let update_waiting = root.join("play/next/r5rust.exe").is_file();
-    if current_build || update_waiting {
-        GameState::Ready { update_waiting }
-    } else {
-        GameState::NoBuild
-    }
-}
-
-fn load_game_root() -> PathBuf {
-    if let Some(config) = config_path()
-        && let Ok(saved) = fs::read_to_string(config)
-    {
-        let saved = saved.trim();
-        if !saved.is_empty() {
-            return PathBuf::from(saved);
-        }
-    }
-
-    if let Some(env_root) = env::var_os("R5RUST_DIR") {
-        let path = PathBuf::from(env_root);
-        if path.join("play.ps1").is_file() {
-            return path;
-        }
-    }
-
-    if Path::new(DEFAULT_GAME_DIR).join("play.ps1").is_file() {
-        return PathBuf::from(DEFAULT_GAME_DIR);
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        for ancestor in exe.ancestors() {
-            let candidate = ancestor.join("games/r5rust");
-            if candidate.join("play.ps1").is_file() {
-                return candidate;
-            }
-        }
-    }
-
-    PathBuf::from(DEFAULT_GAME_DIR)
-}
-
-fn config_path() -> Option<PathBuf> {
-    env::var_os("APPDATA").map(|app_data| {
-        PathBuf::from(app_data)
-            .join("R5Rust Launcher")
-            .join("game_path.txt")
-    })
-}
-
-fn save_game_root(root: &Path) -> std::io::Result<()> {
-    let Some(config) = config_path() else {
-        return Ok(());
-    };
-    let Some(parent) = config.parent() else {
-        return Ok(());
-    };
-    fs::create_dir_all(parent)?;
-    fs::write(config, root.to_string_lossy().as_bytes())
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -801,77 +1045,39 @@ fn apply_theme(ctx: &egui::Context) {
         "barlow-condensed-bold".to_owned(),
         egui::FontData::from_static(include_bytes!("../assets/fonts/BarlowCondensed-Bold.ttf")),
     );
-    fonts.families.insert(
-        egui::FontFamily::Name("Barlow Condensed".into()),
-        vec!["barlow-condensed-bold".to_owned()],
-    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("Barlow Condensed".into()), vec!["barlow-condensed-bold".to_owned()]);
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG;
-    visuals.window_fill = BG;
-    visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(63, 216, 255, 32);
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.bg_fill = RAISED;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(0.0_f32, Color32::TRANSPARENT);
-    visuals.widgets.inactive.fg_stroke.color = SECONDARY;
-    visuals.widgets.inactive.rounding = Rounding::same(0.0);
-    visuals.widgets.hovered.bg_fill = HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(0.0_f32, Color32::TRANSPARENT);
-    visuals.widgets.hovered.fg_stroke.color = TEXT;
-    visuals.widgets.hovered.rounding = Rounding::same(0.0);
-    visuals.widgets.active.bg_fill = CYAN;
-    visuals.widgets.active.bg_stroke = Stroke::new(0.0_f32, Color32::TRANSPARENT);
-    visuals.widgets.active.fg_stroke.color = BG;
-    visuals.widgets.active.rounding = Rounding::same(0.0);
-    style.visuals = visuals;
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = BG;
+    v.extreme_bg_color = RAISED;
+    v.override_text_color = Some(TEXT);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(63, 216, 255, 48);
+    v.selection.stroke = Stroke::new(1.0_f32, CYAN);
+    v.text_cursor.stroke = Stroke::new(2.0_f32, CYAN);
+    v.widgets.noninteractive.bg_fill = PANEL;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    for (w, fill, fg) in [
+        (&mut v.widgets.inactive, RAISED, SECONDARY),
+        (&mut v.widgets.hovered, HOVER, TEXT),
+        (&mut v.widgets.active, HOVER, TEXT),
+        (&mut v.widgets.open, HOVER, TEXT),
+    ] {
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = Stroke::NONE;
+        w.fg_stroke.color = fg;
+        w.rounding = Rounding::same(0.0);
+        w.expansion = 0.0;
+    }
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, CYAN);
+    style.visuals = v;
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(12.0, 8.0);
+    style.spacing.button_padding = Vec2::new(14.0, 8.0);
     ctx.set_style(style);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_root(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after Unix epoch")
-            .as_nanos();
-        env::temp_dir().join(format!("r5rust-launcher-{label}-{stamp}"))
-    }
-
-    #[test]
-    fn detects_a_staged_build_and_pending_update() {
-        let root = temp_root("ready");
-        fs::create_dir_all(root.join("play/current")).unwrap();
-        fs::create_dir_all(root.join("play/next")).unwrap();
-        fs::write(root.join("play.ps1"), "").unwrap();
-        fs::write(root.join("play/current/r5rust.exe"), "").unwrap();
-        fs::write(root.join("play/next/r5rust.exe"), "").unwrap();
-
-        assert_eq!(
-            inspect_game(&root),
-            GameState::Ready {
-                update_waiting: true
-            }
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn distinguishes_invalid_folder_and_missing_build() {
-        let root = temp_root("empty");
-        fs::create_dir_all(&root).unwrap();
-        assert_eq!(inspect_game(&root), GameState::InvalidFolder);
-
-        fs::write(root.join("play.ps1"), "").unwrap();
-        assert_eq!(inspect_game(&root), GameState::NoBuild);
-        fs::remove_dir_all(root).unwrap();
-    }
 }
