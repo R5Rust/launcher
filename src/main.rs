@@ -1252,6 +1252,34 @@ fn toggle_row(ui: &mut egui::Ui, value: &mut bool, title: &str, hint: &str, enab
     changed
 }
 
+/// A row of segmented choices (label + options). Returns true when the selection changed.
+fn choice_row<T: PartialEq + Clone>(ui: &mut egui::Ui, title: &str, value: &mut T, options: &[(T, &str)], enabled: bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(170.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(170.0);
+            ui.label(RichText::new(title).size(13.0).color(if enabled { TEXT } else { MUTED }));
+        });
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (v, label) in options {
+            let on = *value == *v;
+            let text = RichText::new(*label).size(11.0).color(if on { BG } else if enabled { TEXT } else { MUTED });
+            let b = egui::Button::new(text)
+                .fill(if on { if enabled { CYAN } else { MUTED } } else { BG })
+                .stroke(Stroke::NONE)
+                .rounding(Rounding::same(0.0))
+                .min_size(Vec2::new(0.0, 26.0));
+            let r = ui.add_enabled(enabled, b);
+            if r.clicked() && !on {
+                *value = v.clone();
+                changed = true;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    changed
+}
+
 /// Returns true once the value has settled (drag released, or a click / keyboard change).
 fn slider_row(
     ui: &mut egui::Ui,
@@ -1332,6 +1360,53 @@ impl LauncherApp {
                         "Close the game to change these: it saves its own settings when it exits."
                     };
                     ui.label(RichText::new(note).size(11.0).color(if editable { MUTED } else { AMBER }));
+                });
+
+                section(ui, "GRAPHICS", |ui| {
+                    let editable = phase == PlayPhase::Idle;
+                    let g = &mut self.settings.graphics;
+                    let mut save = false;
+                    let mut preset = g.preset.clone();
+                    let presets: Vec<(String, &str)> =
+                        [("lowest", "LOWEST"), ("low", "LOW"), ("medium", "MEDIUM"), ("high", "HIGH"), ("ultra", "ULTRA")].iter().map(|(v, l)| (v.to_string(), *l)).collect();
+                    if choice_row(ui, "Preset", &mut preset, &presets, editable) {
+                        g.apply_preset(&preset);
+                        save = true;
+                    }
+                    if g.preset == "custom" {
+                        ui.label(RichText::new("Custom: the knobs below don't match a preset.").size(11.0).color(MUTED));
+                    }
+                    ui.add_space(6.0);
+                    let mut knobs = false;
+                    let levels = |n: &[&str]| -> Vec<(String, String)> { n.iter().map(|v| (v.to_string(), v.to_uppercase())).collect() };
+                    let tex = levels(&game::TEXTURE_LEVELS);
+                    let tex: Vec<(String, &str)> = tex.iter().map(|(v, l)| (v.clone(), l.as_str())).collect();
+                    knobs |= choice_row(ui, "Texture quality", &mut g.texture_quality, &tex, editable);
+                    let sh = levels(&game::SHADOW_LEVELS);
+                    let sh: Vec<(String, &str)> = sh.iter().map(|(v, l)| (v.clone(), l.as_str())).collect();
+                    knobs |= choice_row(ui, "Sun shadows", &mut g.sun_shadows, &sh, editable);
+                    knobs |= choice_row(ui, "Anisotropic", &mut g.anisotropic, &[(1, "OFF"), (2, "2X"), (4, "4X"), (8, "8X"), (16, "16X")], editable);
+                    knobs |= choice_row(ui, "Anti-aliasing", &mut g.msaa, &[(1, "OFF"), (4, "4X MSAA")], editable);
+                    let mut scale = g.render_scale as f64;
+                    if slider_row(ui, "Render scale", &mut scale, 50.0..=100.0, 5.0, "%", 0, editable) {
+                        g.render_scale = scale.round() as i64;
+                        save = true;
+                    }
+                    save |= choice_row(ui, "FPS cap", &mut g.fps_cap, &[(0, "NONE"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")], editable);
+                    save |= toggle_row(ui, &mut g.vsync, "V-Sync", "Waits for the display: no tearing, a frame of extra input lag.", editable);
+                    if knobs {
+                        g.preset = g.detect_preset();
+                        save = true;
+                    }
+                    if save && let Err(e) = self.settings.save(&self.game_root) {
+                        err = Some(e);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Lighting and effects always render like Apex: presets only trade detail and resolution. Texture quality applies on the next launch, the rest live in game too (Esc > Video).")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 });
 
                 section(ui, "LAUNCH OPTIONS", |ui| {

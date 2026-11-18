@@ -28,7 +28,7 @@ tests). Press **Enter** on any page to play.
 | **Play** | the map's loading screen, MODES menu (Firing Range for now), and a "game files missing" card when the extracted map isn't there |
 | **Patch Notes** | the game's git log, grouped by day, with PLAYING / STAGED / NOT BUILT chips |
 | **Console** | the game's stdout/stderr, live, with a filter, "warnings and errors only", copy, and open log. Shows the last session after a restart |
-| **Settings** | **Game**: FOV, sensitivity, auto sprint, mantle boost, invert look, written straight into the game's `r5rust_settings.toml` (binds kept; locked while the game runs). **Launch options** with a preview of the exact command line. **Game folder**, **Game files** (checks `world.glb`, `collision.bin`, `materials.json`, `meta.json`), **Launcher** (open Console on launch), log/settings file shortcuts |
+| **Settings** | **Game**: FOV, sensitivity, auto sprint, mantle boost, invert look, written straight into the game's `r5rust_settings.toml` (binds kept; locked while the game runs). **Graphics**: preset (Lowest..Ultra) + texture quality, sun shadows, anisotropic filtering, anti-aliasing, render scale, FPS cap, V-Sync, written to the game's `[graphics]` table (same preset table as the game's `graphics.rs`; touching a knob makes it Custom). **Launch options** with a preview of the exact command line. **Game folder**, **Game files** (checks `world.glb`, `collision.bin`, `materials.json`, `meta.json`), **Launcher** (open Console on launch), log/settings file shortcuts |
 
 The footer is always there: installed build hash + commit subject, a status line (update staged, N commits not built,
 files missing, playing...), **BUILD LATEST** (runs `tools\publish.ps1`, live log panel, never touches the copy you're

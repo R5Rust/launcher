@@ -194,12 +194,13 @@ pub struct GameSettings {
     pub invert_y: bool,
     pub auto_sprint: bool,
     pub mantle_boost: bool,
+    pub graphics: GraphicsSettings,
 }
 
 impl Default for GameSettings {
     /// The game's own defaults (crates/client/src/binds.rs UserSettings).
     fn default() -> Self {
-        Self { sensitivity: 1.6, fov: 100.0, invert_y: false, auto_sprint: true, mantle_boost: true }
+        Self { sensitivity: 1.6, fov: 100.0, invert_y: false, auto_sprint: true, mantle_boost: true, graphics: GraphicsSettings::default() }
     }
 }
 
@@ -224,6 +225,7 @@ impl GameSettings {
             invert_y: flag("invert_y", d.invert_y),
             auto_sprint: flag("auto_sprint", d.auto_sprint),
             mantle_boost: flag("mantle_boost", d.mantle_boost),
+            graphics: GraphicsSettings::load(&doc),
         }
     }
 
@@ -240,7 +242,97 @@ impl GameSettings {
         doc["invert_y"] = toml_edit::value(self.invert_y);
         doc["mantle_boost"] = toml_edit::value(self.mantle_boost);
         doc["auto_sprint"] = toml_edit::value(self.auto_sprint);
+        self.graphics.save(&mut doc);
         fs::write(&path, doc.to_string()).map_err(|e| format!("Couldn't save {}: {e}", path.display()))
+    }
+}
+
+/// The game's `[graphics]` table (r5rust crates/client/src/graphics.rs). Presets fill every knob; touching a knob
+/// makes the preset "custom". Strings are the game's serde names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphicsSettings {
+    pub preset: String,
+    pub texture_quality: String,
+    pub anisotropic: i64,
+    pub sun_shadows: String,
+    pub msaa: i64,
+    pub render_scale: i64,
+    pub vsync: bool,
+    pub fps_cap: i64,
+}
+
+pub const PRESETS: [&str; 5] = ["lowest", "low", "medium", "high", "ultra"];
+pub const TEXTURE_LEVELS: [&str; 5] = ["lowest", "low", "medium", "high", "ultra"];
+pub const SHADOW_LEVELS: [&str; 3] = ["off", "low", "high"];
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        let mut g = Self { preset: String::new(), texture_quality: String::new(), anisotropic: 8, sun_shadows: String::new(), msaa: 4, render_scale: 100, vsync: false, fps_cap: 0 };
+        g.apply_preset("high");
+        g
+    }
+}
+
+impl GraphicsSettings {
+    /// Same table as the game's `GraphicsSettings::preset` (vsync, fps cap and render scale are kept).
+    pub fn apply_preset(&mut self, p: &str) {
+        let (tex, aniso, shadows, msaa) = match p {
+            "lowest" => ("lowest", 1, "off", 1),
+            "low" => ("low", 2, "off", 1),
+            "medium" => ("medium", 4, "low", 1),
+            "high" => ("high", 8, "high", 4),
+            _ => ("ultra", 16, "high", 4),
+        };
+        self.preset = p.to_owned();
+        self.texture_quality = tex.to_owned();
+        self.anisotropic = aniso;
+        self.sun_shadows = shadows.to_owned();
+        self.msaa = msaa;
+    }
+
+    /// The preset the knobs match, else "custom".
+    pub fn detect_preset(&self) -> String {
+        PRESETS
+            .iter()
+            .find(|p| {
+                let mut g = self.clone();
+                g.apply_preset(p);
+                g == Self { preset: p.to_string(), ..self.clone() }
+            })
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "custom".to_owned())
+    }
+
+    fn load(doc: &toml_edit::DocumentMut) -> Self {
+        let d = Self::default();
+        let Some(t) = doc.get("graphics").and_then(|t| t.as_table_like()) else { return d };
+        let s = |k: &str, def: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or(def).to_owned();
+        let i = |k: &str, def: i64| t.get(k).and_then(|v| v.as_integer()).unwrap_or(def);
+        Self {
+            preset: s("preset", &d.preset),
+            texture_quality: s("texture_quality", &d.texture_quality),
+            anisotropic: i("anisotropic", d.anisotropic),
+            sun_shadows: s("sun_shadows", &d.sun_shadows),
+            msaa: i("msaa", d.msaa),
+            render_scale: i("render_scale", d.render_scale).clamp(50, 100),
+            vsync: t.get("vsync").and_then(|v| v.as_bool()).unwrap_or(d.vsync),
+            fps_cap: i("fps_cap", d.fps_cap),
+        }
+    }
+
+    fn save(&self, doc: &mut toml_edit::DocumentMut) {
+        if !doc.contains_table("graphics") {
+            doc["graphics"] = toml_edit::table();
+        }
+        let t = &mut doc["graphics"];
+        t["preset"] = toml_edit::value(self.preset.as_str());
+        t["texture_quality"] = toml_edit::value(self.texture_quality.as_str());
+        t["anisotropic"] = toml_edit::value(self.anisotropic);
+        t["sun_shadows"] = toml_edit::value(self.sun_shadows.as_str());
+        t["msaa"] = toml_edit::value(self.msaa);
+        t["render_scale"] = toml_edit::value(self.render_scale);
+        t["vsync"] = toml_edit::value(self.vsync);
+        t["fps_cap"] = toml_edit::value(self.fps_cap);
     }
 }
 
@@ -766,6 +858,31 @@ mod tests {
         assert!(text.contains("[[binds]]") && text.contains("Key = \"KeyW\""), "{text}");
         assert!(text.find("fov").unwrap() < text.find("[[binds]]").unwrap(), "{text}");
         assert_eq!(GameSettings::load(&root).fov, 104.0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graphics_presets_and_save() {
+        for p in PRESETS {
+            let mut g = GraphicsSettings::default();
+            g.apply_preset(p);
+            assert_eq!(g.detect_preset(), p);
+        }
+        let mut g = GraphicsSettings::default();
+        g.anisotropic = 2;
+        assert_eq!(g.detect_preset(), "custom");
+        let root = temp_root("graphics");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(GameSettings::path(&root), "fov = 110.0\n\n[[binds]]\naction = \"Jump\"\n\n[binds.slot1]\nKey = \"Space\"\n").unwrap();
+        let mut s = GameSettings::load(&root);
+        assert_eq!(s.graphics.preset, "high");
+        s.graphics.apply_preset("lowest");
+        s.graphics.fps_cap = 144;
+        s.save(&root).unwrap();
+        let text = fs::read_to_string(GameSettings::path(&root)).unwrap();
+        assert!(text.contains("[graphics]") && text.contains("preset = \"lowest\"") && text.contains("Key = \"Space\""), "{text}");
+        let back = GameSettings::load(&root);
+        assert_eq!((back.graphics.preset.as_str(), back.graphics.msaa, back.graphics.fps_cap), ("lowest", 1, 144));
         fs::remove_dir_all(root).unwrap();
     }
 
