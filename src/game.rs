@@ -18,9 +18,10 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 pub const DEFAULT_GAME_DIR: &str = r"C:\Code\games\r5rust";
+const DEFAULT_ASSETS: &str = r"D:\R5Rust\assets";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL_EVERY: Duration = Duration::from_secs(3);
-const KEEP_LINES: usize = 400;
+const KEEP_LINES: usize = 5000;
 
 /// A command with no console window: the launcher is a GUI app, so every child would otherwise flash one.
 fn quiet(program: &str) -> Command {
@@ -96,6 +97,151 @@ pub struct Snapshot {
     pub commits: Vec<Commit>,
     /// An r5rust.exe is running (ours or not).
     pub running: bool,
+    /// The extracted game files R5Rust loads (never shipped; made from the player's own Apex install).
+    pub files: GameFiles,
+}
+
+/// The map the game loads and whether its extracted files are on disk.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GameFiles {
+    pub assets_root: PathBuf,
+    pub map: String,
+    /// Required files that are missing (empty = good to go).
+    pub missing: Vec<String>,
+    /// The map's loading-screen picture, if it was extracted.
+    pub loadscreen: Option<PathBuf>,
+}
+
+impl GameFiles {
+    const REQUIRED: [&'static str; 4] = ["world.glb", "collision.bin", "materials.json", "meta.json"];
+
+    pub fn read(root: &Path) -> Self {
+        let assets_root = assets_root(root);
+        let map = map_bsp(root);
+        let map_dir = assets_root.join("maps").join(&map);
+        let missing = if map_dir.is_dir() {
+            Self::REQUIRED.iter().filter(|f| !map_dir.join(f).is_file()).map(|f| f.to_string()).collect()
+        } else {
+            vec![format!("maps\\{map}")]
+        };
+        let loadscreen = first_png(&assets_root.join("images").join("ui").join(format!("maps_{map}_loadscreen")));
+        Self { assets_root, map, missing, loadscreen }
+    }
+
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+/// Same order as the game's `Config::assets_root`: env R5RUST_ASSETS > r5rust.toml `assets_root` > D:\R5Rust\assets.
+fn assets_root(root: &Path) -> PathBuf {
+    if let Some(v) = env::var_os("R5RUST_ASSETS").filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
+    }
+    for cfg in [root.join("r5rust.toml"), root.join("play").join("current").join("r5rust.toml")] {
+        if let Some(v) = fs::read_to_string(cfg)
+            .ok()
+            .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+            .and_then(|d| d.get("assets_root").and_then(|v| v.as_str()).map(str::to_owned))
+        {
+            return PathBuf::from(v);
+        }
+    }
+    PathBuf::from(DEFAULT_ASSETS)
+}
+
+/// The map the game loads: r5rust.toml `map`, else the first `bsp` in content\maps, else the Firing Range.
+fn map_bsp(root: &Path) -> String {
+    let from_toml = |path: PathBuf, key: &str| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+            .and_then(|d| d.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+    };
+    if let Some(m) = from_toml(root.join("r5rust.toml"), "map") {
+        return m;
+    }
+    let mut maps: Vec<PathBuf> = fs::read_dir(root.join("content").join("maps"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    maps.sort();
+    maps.into_iter()
+        .find_map(|p| from_toml(p, "bsp"))
+        .unwrap_or_else(|| "mp_rr_canyonlands_staging_mu1".to_owned())
+}
+
+fn first_png(dir: &Path) -> Option<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+        .collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The game's own settings file (r5rust_settings.toml, next to play.ps1). Edited in place with toml_edit so the
+// binds and anything the launcher doesn't know about are kept exactly as the game wrote them.
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameSettings {
+    pub sensitivity: f64,
+    pub fov: f64,
+    pub invert_y: bool,
+    pub auto_sprint: bool,
+    pub mantle_boost: bool,
+}
+
+impl Default for GameSettings {
+    /// The game's own defaults (crates/client/src/binds.rs UserSettings).
+    fn default() -> Self {
+        Self { sensitivity: 1.6, fov: 100.0, invert_y: false, auto_sprint: true, mantle_boost: true }
+    }
+}
+
+impl GameSettings {
+    pub fn path(root: &Path) -> PathBuf {
+        root.join("r5rust_settings.toml")
+    }
+
+    pub fn load(root: &Path) -> Self {
+        let d = Self::default();
+        let Some(doc) = fs::read_to_string(Self::path(root)).ok().and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+        else {
+            return d;
+        };
+        let num = |k: &str, def: f64| {
+            doc.get(k).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))).unwrap_or(def)
+        };
+        let flag = |k: &str, def: bool| doc.get(k).and_then(|v| v.as_bool()).unwrap_or(def);
+        Self {
+            sensitivity: num("sensitivity", d.sensitivity),
+            fov: num("fov", d.fov),
+            invert_y: flag("invert_y", d.invert_y),
+            auto_sprint: flag("auto_sprint", d.auto_sprint),
+            mantle_boost: flag("mantle_boost", d.mantle_boost),
+        }
+    }
+
+    pub fn save(&self, root: &Path) -> Result<(), String> {
+        let path = Self::path(root);
+        let mut doc = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+            .unwrap_or_default();
+        let round = |v: f64, step: f64| (v / step).round() * step;
+        // Top-level keys must come before the [[binds]] tables; toml_edit keeps existing positions.
+        doc["sensitivity"] = toml_edit::value(round(self.sensitivity, 0.01));
+        doc["fov"] = toml_edit::value(round(self.fov, 1.0));
+        doc["invert_y"] = toml_edit::value(self.invert_y);
+        doc["mantle_boost"] = toml_edit::value(self.mantle_boost);
+        doc["auto_sprint"] = toml_edit::value(self.auto_sprint);
+        fs::write(&path, doc.to_string()).map_err(|e| format!("Couldn't save {}: {e}", path.display()))
+    }
 }
 
 impl Snapshot {
@@ -104,6 +250,7 @@ impl Snapshot {
         if matches!(snap.state, GameState::FolderMissing | GameState::InvalidFolder) {
             return snap;
         }
+        snap.files = GameFiles::read(root);
         snap.current = Build::read(&root.join("play/current/version.txt"));
         snap.next = Build::read(&root.join("play/next/version.txt"))
             .filter(|_| root.join("play/next/r5rust.exe").is_file());
@@ -274,7 +421,13 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn start(kind: JobKind, root: &Path, extra_args: &[String], ctx: eframe::egui::Context) -> Result<Self, String> {
+    pub fn start(
+        kind: JobKind,
+        root: &Path,
+        extra_args: &[String],
+        log_path: PathBuf,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self, String> {
         let script = match kind {
             JobKind::Play => root.join("play.ps1"),
             JobKind::Build => root.join("tools").join("publish.ps1"),
@@ -282,9 +435,6 @@ impl Job {
         if !script.is_file() {
             return Err(format!("{} is missing", script.display()));
         }
-        let log_path = data_dir()
-            .map(|d| d.join(if kind == JobKind::Play { "game.log" } else { "build.log" }))
-            .unwrap_or_else(|| env::temp_dir().join("r5rust-launcher.log"));
         if let Some(parent) = log_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -349,6 +499,15 @@ impl Job {
         }
     }
 
+    /// Ends the job and everything it started (play.ps1 waits on r5rust.exe, so the tree takes the game with it).
+    pub fn stop(&mut self) {
+        let pid = self.child.id().to_string();
+        let killed = quiet("taskkill").args(["/PID", &pid, "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        if killed.map(|s| !s.success()).unwrap_or(true) {
+            let _ = self.child.kill();
+        }
+    }
+
     pub fn running(&self) -> bool {
         self.exit.is_none()
     }
@@ -387,6 +546,11 @@ impl Job {
 // ---------------------------------------------------------------------------------------------------------------
 // Settings, kept as small text files in %APPDATA%\R5Rust Launcher (game_path.txt predates this module).
 
+/// Where a job's output is saved: %APPDATA%\R5Rust Launcher\<name>.
+pub fn log_path(name: &str) -> PathBuf {
+    data_dir().map(|d| d.join(name)).unwrap_or_else(|| env::temp_dir().join(format!("r5rust-launcher-{name}")))
+}
+
 pub fn data_dir() -> Option<PathBuf> {
     env::var_os("APPDATA").map(|d| PathBuf::from(d).join("R5Rust Launcher"))
 }
@@ -422,6 +586,20 @@ pub fn load_game_root() -> PathBuf {
         }
     }
     PathBuf::from(DEFAULT_GAME_DIR)
+}
+
+/// The last lines of a log this launcher wrote earlier (game.log / build.log), so the Console isn't empty after a restart.
+pub fn read_last_log(name: &str) -> Option<Vec<String>> {
+    let text = fs::read(data_dir()?.join(name)).ok()?;
+    let text = String::from_utf8_lossy(&text);
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let skip = lines.len().saturating_sub(KEEP_LINES);
+    (!lines.is_empty()).then(|| lines[skip..].to_vec())
+}
+
+/// A yes/no launcher setting stored as "1" / "0".
+pub fn read_flag(name: &str) -> bool {
+    read_setting(name).is_some_and(|v| v == "1")
 }
 
 pub fn load_launch_args() -> String {
@@ -529,13 +707,33 @@ mod tests {
         let root = temp_root("job");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("play.ps1"), "Write-Host \"args: $($args -join '|')\"\nWrite-Host 'no build yet: run tools\\publish.ps1'\nexit 1\n").unwrap();
-        let mut job = Job::start(JobKind::Play, &root, &split_args("--fly --fov 110"), eframe::egui::Context::default()).unwrap();
+        let mut job = Job::start(JobKind::Play, &root, &split_args("--fly --fov 110"), root.join("game.log"), eframe::egui::Context::default()).unwrap();
         wait(&mut job);
         assert_eq!(job.exit, Some(Some(1)));
         assert!(!job.succeeded());
         assert_eq!(job.tail(5), ["args: --fly|--fov|110", r"no build yet: run tools\publish.ps1"]);
         assert_eq!(job.failure_line().as_deref(), Some(r"no build yet: run tools\publish.ps1"));
+        assert!(fs::read_to_string(root.join("game.log")).unwrap().contains("args: --fly"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stop_ends_the_job_and_its_children() {
+        let root = temp_root("stop");
+        fs::create_dir_all(&root).unwrap();
+        // play.ps1 waits on a child process, like it waits on r5rust.exe.
+        fs::write(root.join("play.ps1"), "Write-Host started
+& pwsh -NoProfile -Command 'Start-Sleep 60'
+").unwrap();
+        let mut job = Job::start(JobKind::Play, &root, &[], root.join("game.log"), eframe::egui::Context::default()).unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        assert!(!job.poll(), "job ended on its own");
+        let t = Instant::now();
+        job.stop();
+        wait(&mut job);
+        assert!(t.elapsed() < Duration::from_secs(10));
+        assert!(!job.succeeded());
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -543,12 +741,47 @@ mod tests {
         let root = temp_root("build");
         fs::create_dir_all(root.join("tools")).unwrap();
         fs::write(root.join("tools/publish.ps1"), "[Console]::Error.WriteLine('   Compiling r5rust')\nWrite-Host 'staged: abc'\n").unwrap();
-        let mut job = Job::start(JobKind::Build, &root, &[], eframe::egui::Context::default()).unwrap();
+        let mut job = Job::start(JobKind::Build, &root, &[], root.join("build.log"), eframe::egui::Context::default()).unwrap();
         wait(&mut job);
         assert!(job.succeeded());
         let lines = job.tail(5);
         assert!(lines.iter().any(|l| l.contains("Compiling r5rust")), "{lines:?}");
         assert!(lines.iter().any(|l| l == "staged: abc"), "{lines:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn game_settings_round_trip_keeps_binds() {
+        let root = temp_root("settings");
+        fs::create_dir_all(&root).unwrap();
+        let original = "sensitivity = 0.8\nfov = 120.0\ninvert_y = false\nmantle_boost = false\nauto_sprint = true\n\n[[binds]]\naction = \"Forward\"\nslot2 = \"WheelUp\"\n\n[binds.slot1]\nKey = \"KeyW\"\n";
+        fs::write(GameSettings::path(&root), original).unwrap();
+        let mut s = GameSettings::load(&root);
+        assert_eq!((s.sensitivity, s.fov, s.mantle_boost), (0.8, 120.0, false));
+        s.fov = 104.4;
+        s.invert_y = true;
+        s.save(&root).unwrap();
+        let text = fs::read_to_string(GameSettings::path(&root)).unwrap();
+        assert!(text.contains("fov = 104.0") && text.contains("invert_y = true"), "{text}");
+        assert!(text.contains("[[binds]]") && text.contains("Key = \"KeyW\""), "{text}");
+        assert!(text.find("fov").unwrap() < text.find("[[binds]]").unwrap(), "{text}");
+        assert_eq!(GameSettings::load(&root).fov, 104.0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn game_files_report_whats_missing() {
+        let root = temp_root("files");
+        let assets = root.join("assets");
+        fs::create_dir_all(assets.join("maps/mp_test")).unwrap();
+        fs::create_dir_all(root.join("content/maps")).unwrap();
+        fs::write(root.join("content/maps/test.toml"), "name = \"Test\"\nbsp = \"mp_test\"\n").unwrap();
+        fs::write(root.join("r5rust.toml"), format!("assets_root = '{}'\n", assets.display())).unwrap();
+        fs::write(assets.join("maps/mp_test/world.glb"), "").unwrap();
+        let f = GameFiles::read(&root);
+        assert_eq!(f.map, "mp_test");
+        assert_eq!(f.missing, ["collision.bin", "materials.json", "meta.json"]);
+        assert!(f.loadscreen.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
