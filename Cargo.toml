@@ -1,0 +1,8 @@
+[package]
+name = "r5rust-launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.28"
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }

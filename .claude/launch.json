@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "R5Rust Launcher",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run"]
+    }
+  ]
+}
