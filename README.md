@@ -18,7 +18,7 @@ cd C:\Code\apps\r5rust-launcher
 cargo run --release
 ```
 
-Flags: `--page=notes|console|settings` opens on that page; `--autoplay` presses Play once it's possible (for scripted
+Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--autoplay` presses Play once it's possible (for scripted
 tests). Press **Enter** on any page to play.
 
 ## Pages

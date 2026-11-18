@@ -127,6 +127,11 @@ struct LauncherApp {
     logo: egui::TextureHandle,
     /// `--autoplay`: press Play on the first frame it's possible (for scripted tests).
     autoplay: bool,
+    /// Our own maximize (the window rect to restore). Windows' maximize of a borderless window spills 8px past every
+    /// screen edge, under the taskbar, so the launcher fills the monitor's work area itself instead.
+    restore_rect: Option<Rect>,
+    /// `--maximized`: start maximized (to the work area).
+    start_maximized: bool,
 }
 
 impl LauncherApp {
@@ -166,7 +171,37 @@ impl LauncherApp {
             art_rx: None,
             logo,
             autoplay: std::env::args().any(|a| a == "--autoplay"),
+            restore_rect: None,
+            start_maximized: std::env::args().any(|a| a == "--maximized"),
         }
+    }
+
+    fn toggle_maximize(&mut self, ctx: &egui::Context) {
+        let (outer, ppp) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().native_pixels_per_point));
+        if let Some(saved) = self.restore_rect.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(saved.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(saved.min));
+            return;
+        }
+        let (Some(outer), Some(ppp)) = (outer, ppp) else { return };
+        let center = outer.center() * ppp;
+        let Some(work) = work_area_at(center.x as i32, center.y as i32) else { return };
+        let work = Rect::from_min_max(work.min / ppp, work.max / ppp);
+        self.restore_rect = Some(outer);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(work.min));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(work.size()));
+    }
+
+    /// Dragging the title bar of a maximized window restores it under the cursor, like Windows does.
+    fn drag_from_maximized(&mut self, ctx: &egui::Context, grab: Pos2) {
+        let Some(saved) = self.restore_rect.take() else { return };
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else { return };
+        let frac = ((grab.x - outer.left()) / outer.width()).clamp(0.0, 1.0);
+        let screen_grab = outer.min + grab.to_vec2();
+        let pos = Pos2::new(screen_grab.x - saved.width() * frac, screen_grab.y - grab.y);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(saved.size()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
     fn browse(&mut self) {
@@ -314,6 +349,10 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs(ctx);
+        if self.start_maximized && ctx.input(|i| i.viewport().outer_rect.is_some()) {
+            self.start_maximized = false;
+            self.toggle_maximize(ctx);
+        }
         let snap = self.poller.get();
         self.sync_art(ctx, &snap);
         let phase = self.phase(&snap);
@@ -343,7 +382,11 @@ impl eframe::App for LauncherApp {
         if self.build_panel_open && self.build_job.is_some() {
             self.build_panel(ctx);
         }
-        draw_window_chrome(ctx);
+        match draw_window_chrome(ctx, self.restore_rect.is_some()) {
+            ChromeAction::None => {}
+            ChromeAction::ToggleMaximize => self.toggle_maximize(ctx),
+            ChromeAction::DragFromMaximized(grab) => self.drag_from_maximized(ctx, grab),
+        }
 
         if can_play && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Enter)) {
             action.play = true;
@@ -414,10 +457,11 @@ impl LauncherApp {
                     ui.add_space(4.0);
                 }
 
-                ui.add_space((ui.available_height() - 66.0).max(24.0));
-                let line = ui.cursor().min.y;
-                ui.painter().hline(ui.max_rect().x_range(), line, Stroke::new(1.0_f32, BORDER));
-                ui.add_space(16.0);
+                // The version block sits in a band level with the footer, its top edge on the footer's.
+                let band_top = ui.max_rect().bottom() - FOOTER_H;
+                ui.add_space((band_top - ui.cursor().min.y).max(16.0));
+                ui.painter().hline(ui.max_rect().x_range(), band_top, Stroke::new(1.0_f32, BORDER));
+                ui.add_space((FOOTER_H - 44.0) / 2.0 - 4.0);
                 let build = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("none");
                 for (key, value) in [("GAME", build.to_owned()), ("LAUNCHER", format!("v{}", env!("CARGO_PKG_VERSION")))]
                 {
@@ -1435,10 +1479,17 @@ impl LauncherApp {
 // -------------------------------------------------------------------------------------------------------------------
 // Window chrome and painting helpers
 
-fn draw_window_chrome(ctx: &egui::Context) {
+enum ChromeAction {
+    None,
+    ToggleMaximize,
+    /// The title bar was dragged while maximized; the point is where it was grabbed (window points).
+    DragFromMaximized(Pos2),
+}
+
+fn draw_window_chrome(ctx: &egui::Context, maximized: bool) -> ChromeAction {
     let screen = ctx.screen_rect();
     let bar_size = Vec2::new(screen.width(), 36.0);
-    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    let mut action = ChromeAction::None;
 
     egui::Area::new(egui::Id::new("window-chrome"))
         .order(egui::Order::Foreground)
@@ -1453,10 +1504,13 @@ fn draw_window_chrome(ctx: &egui::Context) {
             let drag_area = Rect::from_min_max(bar.min, Pos2::new(minimize.left(), bar.bottom()));
             let drag = ui.interact(drag_area, egui::Id::new("window-drag-area"), Sense::click_and_drag());
             if drag.drag_started() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                match (maximized, drag.interact_pointer_pos()) {
+                    (true, Some(grab)) => action = ChromeAction::DragFromMaximized(grab),
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
+                }
             }
             if drag.double_clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                action = ChromeAction::ToggleMaximize;
             }
 
             let min_r = ui.interact(minimize, egui::Id::new("window-minimize"), Sense::click());
@@ -1475,7 +1529,16 @@ fn draw_window_chrome(ctx: &egui::Context) {
             let s = Stroke::new(1.2_f32, TEXT);
             let m = minimize.center();
             painter.line_segment([Pos2::new(m.x - 5.0, m.y + 3.0), Pos2::new(m.x + 5.0, m.y + 3.0)], s);
-            painter.rect_stroke(maximize.shrink(10.0), Rounding::same(0.0), s);
+            if maximized {
+                // Restore: two overlapping squares.
+                let front = Rect::from_center_size(maximize.center() + Vec2::new(-1.5, 1.5), Vec2::splat(9.0));
+                let back = front.translate(Vec2::new(3.0, -3.0));
+                painter.line_segment([Pos2::new(back.left(), back.top()), Pos2::new(back.right(), back.top())], s);
+                painter.line_segment([Pos2::new(back.right(), back.top()), Pos2::new(back.right(), back.bottom())], s);
+                painter.rect_stroke(front, Rounding::same(0.0), s);
+            } else {
+                painter.rect_stroke(maximize.shrink(10.0), Rounding::same(0.0), s);
+            }
             let c = close.center();
             painter.line_segment([Pos2::new(c.x - 5.0, c.y - 5.0), Pos2::new(c.x + 5.0, c.y + 5.0)], s);
             painter.line_segment([Pos2::new(c.x + 5.0, c.y - 5.0), Pos2::new(c.x - 5.0, c.y + 5.0)], s);
@@ -1484,12 +1547,41 @@ fn draw_window_chrome(ctx: &egui::Context) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
             if max_r.clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                action = ChromeAction::ToggleMaximize;
             }
             if close_r.clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+    action
+}
+
+/// The work area (screen minus taskbar) of the monitor under a point, in physical pixels.
+#[cfg(windows)]
+fn work_area_at(x: i32, y: i32) -> Option<Rect> {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
+    };
+    // SAFETY: MonitorFromPoint never fails with DEFAULTTONEAREST; MONITORINFO is zeroed and sized as required.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let w = info.rcWork;
+        Some(Rect::from_min_max(
+            Pos2::new(w.left as f32, w.top as f32),
+            Pos2::new(w.right as f32, w.bottom as f32),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn work_area_at(_x: i32, _y: i32) -> Option<Rect> {
+    None
 }
 
 fn paint_vertical_scrim(painter: &egui::Painter, bounds: Rect, top_alpha: u8, bottom_alpha: u8) {
