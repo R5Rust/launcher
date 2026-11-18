@@ -32,6 +32,8 @@ fn main() -> eframe::Result<()> {
             .with_title("R5Rust Launcher")
             .with_inner_size([1300.0, 820.0])
             .with_min_inner_size([1080.0, 680.0])
+            .with_decorations(false)
+            .with_resizable(true)
             .with_icon(load_window_icon()),
         ..Default::default()
     };
@@ -63,6 +65,7 @@ struct LauncherApp {
     game_root: PathBuf,
     notice: Option<(String, bool)>,
     selected_mode: GameMode,
+    mode_menu_open: bool,
     cover: egui::TextureHandle,
     cover_size: Vec2,
     logo: egui::TextureHandle,
@@ -102,6 +105,7 @@ impl LauncherApp {
             game_root: load_game_root(),
             notice: None,
             selected_mode: GameMode::FiringRange,
+            mode_menu_open: false,
             cover,
             cover_size,
             logo,
@@ -167,79 +171,79 @@ impl eframe::App for LauncherApp {
         let mut browse_clicked = false;
         let mut launch_clicked = false;
         let mut select_firing_range = false;
+        let mut toggle_modes_menu = false;
+        let mut mode_menu_position = Pos2::ZERO;
 
         egui::SidePanel::left("launcher-rail")
             .exact_width(228.0)
             .resizable(false)
             .frame(egui::Frame::none().fill(RAIL).inner_margin(0.0))
             .show(ctx, |ui| {
-                ui.add_space(34.0);
+                ui.add_space(40.0);
+                let brand_width = 140.0;
                 ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - brand_width) * 0.5).max(0.0));
                     ui.add(
-                        egui::Image::new((self.logo.id(), Vec2::splat(40.0)))
-                            .fit_to_exact_size(Vec2::splat(40.0)),
+                        egui::Image::new((self.logo.id(), Vec2::splat(36.0)))
+                            .fit_to_exact_size(Vec2::splat(36.0)),
                     );
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("R5RUST").font(display_font(22.0)).color(TEXT));
+                        ui.label(RichText::new("R5RUST").font(display_font(21.0)).color(TEXT));
                         ui.label(RichText::new("LAUNCHER").size(9.0).strong().color(MUTED));
                     });
                 });
 
-                ui.add_space(52.0);
-                ui.add_space(24.0);
-                ui.label(RichText::new("GAME").size(10.0).strong().color(MUTED));
-                ui.add_space(12.0);
-                let (nav_rect, nav_response) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
-                let nav_painter = ui.painter();
-                if nav_response.hovered() {
-                    nav_painter.rect_filled(nav_rect, Rounding::same(0.0), HOVER);
-                }
-                nav_painter.rect_filled(
-                    Rect::from_min_size(nav_rect.left_top(), Vec2::new(3.0, nav_rect.height())),
-                    Rounding::same(0.0),
-                    CYAN,
-                );
-                let icon_center = Pos2::new(nav_rect.left() + 28.0, nav_rect.center().y);
-                nav_painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        Pos2::new(icon_center.x - 4.0, icon_center.y - 6.0),
-                        Pos2::new(icon_center.x + 6.0, icon_center.y),
-                        Pos2::new(icon_center.x - 4.0, icon_center.y + 6.0),
-                    ],
-                    CYAN,
-                    Stroke::NONE,
-                ));
-                nav_painter.text(
-                    Pos2::new(nav_rect.left() + 48.0, nav_rect.center().y),
-                    Align2::LEFT_CENTER,
-                    "PLAY",
-                    FontId::proportional(13.0),
-                    TEXT,
-                );
-                if nav_response.clicked() {
-                    select_firing_range = true;
-                }
+                ui.add_space(34.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let nav_width = (ui.available_width() - 10.0).max(0.0);
+                    let (nav_rect, nav_response) =
+                        ui.allocate_exact_size(Vec2::new(nav_width, 44.0), Sense::click());
+                    let nav_painter = ui.painter();
+                    if nav_response.hovered() {
+                        nav_painter.rect_filled(nav_rect, Rounding::same(0.0), HOVER);
+                    }
+                    nav_painter.rect_filled(
+                        Rect::from_min_size(nav_rect.left_top(), Vec2::new(3.0, nav_rect.height())),
+                        Rounding::same(0.0),
+                        CYAN,
+                    );
+                    let icon_center = Pos2::new(nav_rect.left() + 28.0, nav_rect.center().y);
+                    nav_painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            Pos2::new(icon_center.x - 4.0, icon_center.y - 6.0),
+                            Pos2::new(icon_center.x + 6.0, icon_center.y),
+                            Pos2::new(icon_center.x - 4.0, icon_center.y + 6.0),
+                        ],
+                        CYAN,
+                        Stroke::NONE,
+                    ));
+                    nav_painter.text(
+                        Pos2::new(nav_rect.left() + 48.0, nav_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        "PLAY",
+                        FontId::proportional(13.0),
+                        TEXT,
+                    );
+                    if nav_response.clicked() {
+                        select_firing_range = true;
+                    }
+                    ui.add_space(10.0);
+                });
 
-                ui.add_space((ui.available_height() - 142.0).max(28.0));
+                ui.add_space((ui.available_height() - 50.0).max(24.0));
                 ui.separator();
                 ui.add_space(16.0);
-                ui.label(RichText::new("GAME BUILD").size(10.0).strong().color(MUTED));
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(state.status_label())
-                        .size(12.0)
-                        .strong()
-                        .color(SECONDARY),
-                );
-                ui.add_space(5.0);
-                ui.label(
-                    RichText::new(env!("CARGO_PKG_VERSION"))
-                        .size(10.0)
-                        .monospace()
-                        .color(MUTED),
-                );
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .size(11.0)
+                            .monospace()
+                            .color(MUTED),
+                    );
+                });
             });
 
         egui::TopBottomPanel::bottom("play-footer")
@@ -287,23 +291,48 @@ impl eframe::App for LauncherApp {
                         launch_clicked = ui.add_enabled(state.is_ready(), play_button).clicked();
 
                         ui.add_space(12.0);
-                        if ui
-                            .add_sized(
-                                Vec2::new(140.0, 40.0),
-                                egui::Button::new(
-                                    RichText::new("CHANGE FOLDER")
-                                        .size(10.0)
-                                        .strong()
-                                        .color(SECONDARY),
-                                )
-                                .fill(RAISED)
-                                .stroke(Stroke::NONE)
-                                .rounding(Rounding::same(0.0)),
-                            )
-                            .clicked()
-                        {
-                            browse_clicked = true;
-                        }
+                        let folder_name = self
+                            .game_root
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Choose a folder".to_owned());
+                        let (folder_rect, folder_response) =
+                            ui.allocate_exact_size(Vec2::new(228.0, 56.0), Sense::click());
+                        let folder_painter = ui.painter();
+                        folder_painter.rect_filled(
+                            folder_rect,
+                            Rounding::same(0.0),
+                            if folder_response.hovered() {
+                                HOVER
+                            } else {
+                                RAISED
+                            },
+                        );
+                        folder_painter.text(
+                            Pos2::new(folder_rect.left() + 16.0, folder_rect.top() + 14.0),
+                            Align2::LEFT_TOP,
+                            "GAME FOLDER",
+                            FontId::proportional(9.0),
+                            MUTED,
+                        );
+                        folder_painter.text(
+                            Pos2::new(folder_rect.left() + 16.0, folder_rect.top() + 34.0),
+                            Align2::LEFT_TOP,
+                            folder_name,
+                            FontId::proportional(13.0),
+                            TEXT,
+                        );
+                        let chevron =
+                            Pos2::new(folder_rect.right() - 18.0, folder_rect.center().y + 1.0);
+                        folder_painter.line_segment(
+                            [Pos2::new(chevron.x - 4.0, chevron.y - 2.0), chevron],
+                            Stroke::new(1.2_f32, SECONDARY),
+                        );
+                        folder_painter.line_segment(
+                            [chevron, Pos2::new(chevron.x + 4.0, chevron.y - 2.0)],
+                            Stroke::new(1.2_f32, SECONDARY),
+                        );
+                        browse_clicked = folder_response.clicked();
                     });
                 });
             });
@@ -348,53 +377,40 @@ impl eframe::App for LauncherApp {
                 );
                 paint_horizontal_scrim(painter, left_scrim, 142, 0);
 
-                let tab_y = hero_rect.top() + 43.0;
-                let range_tab = Rect::from_min_size(
-                    Pos2::new(hero_rect.left() + 42.0, tab_y),
-                    Vec2::new(166.0, 38.0),
+                let mode_tab = Rect::from_min_size(
+                    Pos2::new(hero_rect.left() + 40.0, hero_rect.top() + 42.0),
+                    Vec2::new(132.0, 38.0),
                 );
-                let range_response = ui.interact(
-                    range_tab,
-                    egui::Id::new("mode-tab-firing-range"),
-                    Sense::click(),
-                );
+                let mode_response =
+                    ui.interact(mode_tab, egui::Id::new("mode-tab"), Sense::click());
                 painter.text(
-                    Pos2::new(range_tab.left(), range_tab.top() + 9.0),
+                    Pos2::new(mode_tab.left(), mode_tab.top() + 8.0),
                     Align2::LEFT_TOP,
-                    "FIRING RANGE",
-                    FontId::new(15.0, egui::FontFamily::Name("Barlow Condensed".into())),
+                    "MODES",
+                    FontId::new(17.0, egui::FontFamily::Name("Barlow Condensed".into())),
                     TEXT,
+                );
+                let arrow = Pos2::new(mode_tab.left() + 78.0, mode_tab.top() + 18.0);
+                painter.line_segment(
+                    [Pos2::new(arrow.x - 4.0, arrow.y - 2.0), arrow],
+                    Stroke::new(1.3_f32, TEXT),
+                );
+                painter.line_segment(
+                    [arrow, Pos2::new(arrow.x + 4.0, arrow.y - 2.0)],
+                    Stroke::new(1.3_f32, TEXT),
                 );
                 painter.rect_filled(
                     Rect::from_min_size(
-                        Pos2::new(range_tab.left(), range_tab.bottom() - 2.0),
-                        Vec2::new(88.0, 2.0),
+                        Pos2::new(mode_tab.left(), mode_tab.bottom() - 2.0),
+                        Vec2::new(72.0, 2.0),
                     ),
                     Rounding::same(0.0),
                     CYAN,
                 );
-                if range_response.clicked() {
-                    select_firing_range = true;
+                mode_menu_position = Pos2::new(mode_tab.left(), mode_tab.bottom() + 10.0);
+                if mode_response.clicked() {
+                    toggle_modes_menu = true;
                 }
-
-                let more_tab = Rect::from_min_size(
-                    Pos2::new(range_tab.right() + 24.0, tab_y),
-                    Vec2::new(176.0, 38.0),
-                );
-                painter.text(
-                    Pos2::new(more_tab.left(), more_tab.top() + 9.0),
-                    Align2::LEFT_TOP,
-                    "MORE MODES",
-                    FontId::new(15.0, egui::FontFamily::Name("Barlow Condensed".into())),
-                    MUTED,
-                );
-                painter.text(
-                    Pos2::new(more_tab.left(), more_tab.bottom() + 4.0),
-                    Align2::LEFT_TOP,
-                    "COMING LATER",
-                    FontId::proportional(9.0),
-                    MUTED,
-                );
 
                 painter.text(
                     Pos2::new(hero_rect.right() - 36.0, hero_rect.top() + 55.0),
@@ -417,7 +433,7 @@ impl eframe::App for LauncherApp {
                     Pos2::new(title_x - 2.0, title_y + 15.0),
                     Align2::LEFT_TOP,
                     self.selected_mode.title().to_uppercase(),
-                    display_font((hero_rect.width() * 0.085).clamp(52.0, 78.0)),
+                    display_font(68.0),
                     TEXT,
                 );
                 painter.text(
@@ -436,9 +452,92 @@ impl eframe::App for LauncherApp {
                 );
             });
 
+        if toggle_modes_menu {
+            self.mode_menu_open = !self.mode_menu_open;
+        }
+
+        let mut choose_mode = false;
+        if self.mode_menu_open {
+            egui::Area::new(egui::Id::new("mode-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(mode_menu_position)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(PANEL)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(312.0);
+                            ui.label(RichText::new("GAME MODES").size(10.0).strong().color(MUTED));
+                            ui.add_space(8.0);
+
+                            let (row_rect, row_response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 74.0),
+                                Sense::click(),
+                            );
+                            let menu_painter = ui.painter();
+                            menu_painter.rect_filled(
+                                row_rect,
+                                Rounding::same(0.0),
+                                if row_response.hovered() {
+                                    HOVER
+                                } else {
+                                    RAISED
+                                },
+                            );
+                            menu_painter.rect_filled(
+                                Rect::from_min_size(
+                                    row_rect.left_top(),
+                                    Vec2::new(2.0, row_rect.height()),
+                                ),
+                                Rounding::same(0.0),
+                                CYAN,
+                            );
+                            let thumb_rect = Rect::from_min_size(
+                                row_rect.left_top() + Vec2::new(10.0, 9.0),
+                                Vec2::new(88.0, 56.0),
+                            );
+                            menu_painter.image(
+                                self.cover.id(),
+                                thumb_rect,
+                                cover_uv(self.cover_size, thumb_rect.size()),
+                                Color32::WHITE,
+                            );
+                            menu_painter.text(
+                                Pos2::new(thumb_rect.right() + 12.0, row_rect.top() + 23.0),
+                                Align2::LEFT_TOP,
+                                "Firing Range",
+                                FontId::proportional(13.0),
+                                TEXT,
+                            );
+                            menu_painter.text(
+                                Pos2::new(thumb_rect.right() + 12.0, row_rect.top() + 45.0),
+                                Align2::LEFT_TOP,
+                                "AVAILABLE",
+                                FontId::proportional(9.0),
+                                SECONDARY,
+                            );
+                            if row_response.clicked() {
+                                choose_mode = true;
+                            }
+
+                            ui.add_space(9.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("MORE MODES").size(9.0).strong().color(MUTED));
+                            ui.label(RichText::new("Coming later").size(11.0).color(SECONDARY));
+                        });
+                });
+        }
+
+        if choose_mode {
+            select_firing_range = true;
+            self.mode_menu_open = false;
+        }
         if select_firing_range {
             self.selected_mode = GameMode::FiringRange;
         }
+        draw_window_chrome(ctx);
         if browse_clicked {
             self.browse();
         }
@@ -446,6 +545,97 @@ impl eframe::App for LauncherApp {
             self.launch();
         }
     }
+}
+
+fn draw_window_chrome(ctx: &egui::Context) {
+    let screen = ctx.screen_rect();
+    let bar_size = Vec2::new(screen.width(), 36.0);
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+
+    egui::Area::new(egui::Id::new("window-chrome"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .default_size(bar_size)
+        .show(ctx, |ui| {
+            let (bar, _) = ui.allocate_exact_size(bar_size, Sense::hover());
+            let close = Rect::from_min_size(
+                Pos2::new(bar.right() - 40.0, bar.top() + 3.0),
+                Vec2::new(36.0, 30.0),
+            );
+            let maximize = Rect::from_min_size(
+                Pos2::new(close.left() - 38.0, bar.top() + 3.0),
+                Vec2::new(36.0, 30.0),
+            );
+            let minimize = Rect::from_min_size(
+                Pos2::new(maximize.left() - 38.0, bar.top() + 3.0),
+                Vec2::new(36.0, 30.0),
+            );
+            let drag_area = Rect::from_min_max(bar.min, Pos2::new(minimize.left(), bar.bottom()));
+            let drag = ui.interact(
+                drag_area,
+                egui::Id::new("window-drag-area"),
+                Sense::click_and_drag(),
+            );
+            if drag.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+
+            let minimize_response =
+                ui.interact(minimize, egui::Id::new("window-minimize"), Sense::click());
+            let maximize_response =
+                ui.interact(maximize, egui::Id::new("window-maximize"), Sense::click());
+            let close_response = ui.interact(close, egui::Id::new("window-close"), Sense::click());
+            let painter = ui.painter();
+
+            if minimize_response.hovered() {
+                painter.rect_filled(minimize, Rounding::same(0.0), HOVER);
+            }
+            if maximize_response.hovered() {
+                painter.rect_filled(maximize, Rounding::same(0.0), HOVER);
+            }
+            if close_response.hovered() {
+                painter.rect_filled(close, Rounding::same(0.0), Color32::from_rgb(224, 68, 58));
+            }
+
+            let icon_stroke = Stroke::new(1.2_f32, TEXT);
+            painter.line_segment(
+                [
+                    Pos2::new(minimize.center().x - 5.0, minimize.center().y + 3.0),
+                    Pos2::new(minimize.center().x + 5.0, minimize.center().y + 3.0),
+                ],
+                icon_stroke,
+            );
+            let max_icon = maximize.shrink(10.0);
+            painter.rect_stroke(max_icon, Rounding::same(0.0), icon_stroke);
+            let close_center = close.center();
+            painter.line_segment(
+                [
+                    Pos2::new(close_center.x - 5.0, close_center.y - 5.0),
+                    Pos2::new(close_center.x + 5.0, close_center.y + 5.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(close_center.x + 5.0, close_center.y - 5.0),
+                    Pos2::new(close_center.x - 5.0, close_center.y + 5.0),
+                ],
+                icon_stroke,
+            );
+
+            if minimize_response.clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            if maximize_response.clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            if close_response.clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
 }
 
 fn paint_vertical_scrim(painter: &egui::Painter, bounds: Rect, top_alpha: u8, bottom_alpha: u8) {
