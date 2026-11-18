@@ -9,11 +9,16 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, Vec2};
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Rounding, Sense, Stroke,
+    Vec2,
+};
 
 const DEFAULT_GAME_DIR: &str = r"C:\Code\games\r5rust";
+const SIDE: Color32 = Color32::from_rgb(14, 16, 21);
 const BG: Color32 = Color32::from_rgb(20, 22, 27);
 const CARD: Color32 = Color32::from_rgb(27, 29, 34);
+const ROW: Color32 = Color32::from_rgb(34, 36, 41);
 const TEXT: Color32 = Color32::from_rgb(228, 230, 235);
 const MUTED: Color32 = Color32::from_rgb(138, 140, 145);
 const DIM: Color32 = Color32::from_rgb(91, 93, 98);
@@ -26,8 +31,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("R5Rust Launcher")
-            .with_inner_size([560.0, 410.0])
-            .with_min_inner_size([460.0, 360.0]),
+            .with_inner_size([1100.0, 720.0])
+            .with_min_inner_size([900.0, 640.0])
+            .with_icon(load_window_icon()),
         ..Default::default()
     };
 
@@ -38,17 +44,64 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+fn load_window_icon() -> egui::IconData {
+    let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .expect("the R5Rust app icon should be available")
+        .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    egui::IconData {
+        rgba: icon.into_raw(),
+        width: 256,
+        height: 256,
+    }
+}
+
 struct LauncherApp {
     game_root: PathBuf,
     notice: Option<(String, bool)>,
+    selected_mode: GameMode,
+    cover: egui::TextureHandle,
+    cover_size: Vec2,
+    logo: egui::TextureHandle,
 }
 
 impl LauncherApp {
     fn new(ctx: &egui::Context) -> Self {
         apply_theme(ctx);
+
+        let image = image::load_from_memory(include_bytes!("../assets/firing-range.jpg"))
+            .expect("the Firing Range image should be available");
+        let cover_size = Vec2::new(image.width() as f32, image.height() as f32);
+        let cover_rgba = image.to_rgba8();
+        let cover = ctx.load_texture(
+            "firing-range-cover",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [cover_size.x as usize, cover_size.y as usize],
+                &cover_rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+
+        let logo_image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+            .expect("the R5Rust app icon should be available");
+        let logo_size = Vec2::new(logo_image.width() as f32, logo_image.height() as f32);
+        let logo_rgba = logo_image.to_rgba8();
+        let logo = ctx.load_texture(
+            "r5rust-logo",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [logo_size.x as usize, logo_size.y as usize],
+                &logo_rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+
         Self {
             game_root: load_game_root(),
             notice: None,
+            selected_mode: GameMode::FiringRange,
+            cover,
+            cover_size,
+            logo,
         }
     }
 
@@ -72,6 +125,12 @@ impl LauncherApp {
     }
 
     fn launch(&mut self) {
+        match self.selected_mode {
+            GameMode::FiringRange => self.launch_game_script(),
+        }
+    }
+
+    fn launch_game_script(&mut self) {
         let script = self.game_root.join("play.ps1");
         let mut command = Command::new("pwsh");
         command
@@ -93,7 +152,7 @@ impl LauncherApp {
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
         match command.spawn() {
-            Ok(_) => self.notice = Some(("Starting R5Rust…".to_owned(), false)),
+            Ok(_) => self.notice = Some(("Starting Firing Range…".to_owned(), false)),
             Err(error) => {
                 self.notice = Some((format!("Couldn't start PowerShell: {error}"), true));
             }
@@ -106,77 +165,226 @@ impl eframe::App for LauncherApp {
         let state = self.state();
         let mut browse_clicked = false;
         let mut launch_clicked = false;
+        let mut select_firing_range = false;
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(24.0))
+        egui::SidePanel::left("launcher-sidebar")
+            .exact_width(238.0)
+            .resizable(false)
+            .frame(egui::Frame::none().fill(SIDE).inner_margin(18.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("R5Rust").size(16.0).strong().color(TEXT));
-                    ui.label(RichText::new("LAUNCHER").size(10.0).strong().color(CLAY));
+                    ui.add(
+                        egui::Image::new((self.logo.id(), Vec2::splat(36.0)))
+                            .fit_to_exact_size(Vec2::splat(36.0))
+                            .rounding(Rounding::same(8.0)),
+                    );
+                    ui.add_space(9.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("R5Rust").size(16.0).strong().color(TEXT));
+                        ui.label(RichText::new("LAUNCHER").size(9.0).strong().color(CLAY));
+                    });
                 });
 
-                ui.add_space(20.0);
+                ui.add_space(30.0);
+                ui.label(RichText::new("GAME MODES").size(10.0).strong().color(DIM));
+                ui.add_space(10.0);
+
+                if mode_tile(
+                    ui,
+                    &self.cover,
+                    self.cover_size,
+                    self.selected_mode == GameMode::FiringRange,
+                ) {
+                    select_firing_range = true;
+                }
+
+                ui.add_space(9.0);
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 24, 29))
+                    .stroke(Stroke::new(1.0_f32, LINE))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(11.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("+ ").size(15.0).strong().color(DIM));
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("More modes").size(12.0).strong().color(MUTED),
+                                );
+                                ui.label(RichText::new("Coming later").size(10.0).color(DIM));
+                            });
+                        });
+                    });
+
+                let footer_space = (ui.available_height() - 170.0).max(24.0);
+                ui.add_space(footer_space);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.label(RichText::new("GAME INSTALL").size(10.0).strong().color(DIM));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, state.color());
+                    ui.label(
+                        RichText::new(state.sidebar_status())
+                            .size(11.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                });
+                ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Back to the range.")
-                        .size(26.0)
+                    RichText::new(self.game_root.display().to_string())
+                        .size(9.0)
+                        .monospace()
+                        .color(DIM),
+                );
+                ui.add_space(9.0);
+                if ui
+                    .add_sized(
+                        Vec2::new(ui.available_width(), 34.0),
+                        egui::Button::new(RichText::new("Change game folder").size(11.0)),
+                    )
+                    .clicked()
+                {
+                    browse_clicked = true;
+                }
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(32.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PLAY").size(10.0).strong().color(DIM));
+                    ui.label(RichText::new("/").size(10.0).color(DIM));
+                    ui.label(
+                        RichText::new("MODE SELECT")
+                            .size(10.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        status_pill(ui, state);
+                    });
+                });
+
+                ui.add_space(23.0);
+                ui.label(
+                    RichText::new("Choose your mode")
+                        .size(29.0)
                         .strong()
                         .color(TEXT),
                 );
                 ui.label(
-                    RichText::new("Launch your local R5Rust build.")
-                        .size(13.0)
-                        .color(MUTED),
+                    RichText::new(
+                        "Jump into the range. More modes will appear here as they arrive.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
                 );
                 ui.add_space(20.0);
 
-                egui::Frame::group(ui.style())
-                    .fill(CARD)
-                    .stroke(Stroke::new(1.0_f32, LINE))
-                    .inner_margin(18.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                let card_width = ui.available_width();
+                let card_height = (card_width * 0.46).clamp(290.0, 380.0);
+                let card_size = Vec2::new(card_width, card_height);
+                let card = egui::Image::new((self.cover.id(), self.cover_size))
+                    .fit_to_exact_size(card_size)
+                    .uv(cover_uv(self.cover_size, card_size))
+                    .rounding(Rounding::same(12.0))
+                    .sense(Sense::click());
+                let response = ui.add(card);
+                let rect = response.rect;
+                let painter = ui.painter();
 
-                        ui.horizontal(|ui| {
-                            let (dot, _) =
-                                ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 4.0, state.color());
-                            ui.label(RichText::new(state.title()).size(15.0).strong().color(TEXT));
-                        });
+                let badge = Rect::from_min_size(
+                    rect.left_top() + Vec2::new(17.0, 17.0),
+                    Vec2::new(132.0, 25.0),
+                );
+                painter.rect_filled(badge, Rounding::same(6.0), Color32::from_black_alpha(175));
+                painter.text(
+                    badge.center(),
+                    Align2::CENTER_CENTER,
+                    "AVAILABLE MODE",
+                    FontId::proportional(9.0),
+                    TEXT,
+                );
 
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(state.detail()).size(12.0).color(MUTED));
-                        ui.add_space(16.0);
+                let selected_badge = Rect::from_min_size(
+                    Pos2::new(rect.right() - 102.0, rect.top() + 17.0),
+                    Vec2::new(85.0, 25.0),
+                );
+                painter.rect_filled(
+                    selected_badge,
+                    Rounding::same(6.0),
+                    Color32::from_black_alpha(175),
+                );
+                painter.circle_filled(
+                    Pos2::new(selected_badge.left() + 14.0, selected_badge.center().y),
+                    3.0,
+                    OK,
+                );
+                painter.text(
+                    Pos2::new(selected_badge.left() + 24.0, selected_badge.center().y),
+                    Align2::LEFT_CENTER,
+                    "SELECTED",
+                    FontId::proportional(9.0),
+                    TEXT,
+                );
 
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("GAME FOLDER").size(10.0).strong().color(DIM));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(RichText::new("Browse…").color(TEXT)).clicked() {
-                                    browse_clicked = true;
-                                }
-                            });
-                        });
-                        ui.add_space(4.0);
+                let info = Rect::from_min_max(
+                    Pos2::new(rect.left() + 12.0, rect.bottom() - 120.0),
+                    Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
+                );
+                painter.rect_filled(info, Rounding::same(9.0), Color32::from_black_alpha(198));
+                painter.text(
+                    Pos2::new(info.left() + 18.0, info.top() + 17.0),
+                    Align2::LEFT_TOP,
+                    "FIRING RANGE",
+                    FontId::proportional(24.0),
+                    TEXT,
+                );
+                painter.text(
+                    Pos2::new(info.left() + 18.0, info.top() + 50.0),
+                    Align2::LEFT_TOP,
+                    "Movement practice  /  Free roam  /  Solo",
+                    FontId::proportional(12.0),
+                    Color32::from_rgb(205, 207, 212),
+                );
+                painter.rect_stroke(
+                    rect,
+                    Rounding::same(12.0),
+                    Stroke::new(1.0_f32, if response.hovered() { CLAY } else { LINE }),
+                );
+
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("SELECTED MODE").size(9.0).strong().color(DIM));
+                        ui.add_space(2.0);
                         ui.label(
-                            RichText::new(self.game_root.display().to_string())
-                                .size(11.0)
-                                .monospace()
-                                .color(MUTED),
+                            RichText::new(self.selected_mode.title())
+                                .size(15.0)
+                                .strong()
+                                .color(TEXT),
                         );
-
-                        ui.add_space(18.0);
-                        ui.horizontal(|ui| {
-                            let play =
-                                egui::Button::new(RichText::new("Play R5Rust").strong().color(BG))
-                                    .fill(CLAY)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(142.0, 40.0));
-                            launch_clicked = ui.add_enabled(state.is_ready(), play).clicked();
-                        });
                     });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let play = egui::Button::new(
+                            RichText::new("Launch Firing Range  ›")
+                                .size(13.0)
+                                .strong()
+                                .color(BG),
+                        )
+                        .fill(CLAY)
+                        .stroke(Stroke::NONE)
+                        .min_size(Vec2::new(198.0, 46.0));
+                        launch_clicked = ui.add_enabled(state.is_ready(), play).clicked();
+                    });
+                });
 
                 if let Some((message, is_error)) = &self.notice {
                     ui.add_space(12.0);
-                    ui.label(RichText::new(message).size(12.0).color(if *is_error {
+                    ui.label(RichText::new(message).size(11.0).color(if *is_error {
                         WARN
                     } else {
                         OK
@@ -184,11 +392,110 @@ impl eframe::App for LauncherApp {
                 }
             });
 
+        if select_firing_range {
+            self.selected_mode = GameMode::FiringRange;
+        }
         if browse_clicked {
             self.browse();
         }
         if launch_clicked {
             self.launch();
+        }
+    }
+}
+
+fn mode_tile(
+    ui: &mut egui::Ui,
+    cover: &egui::TextureHandle,
+    cover_size: Vec2,
+    selected: bool,
+) -> bool {
+    let mut clicked = false;
+    egui::Frame::none()
+        .fill(if selected { ROW } else { CARD })
+        .stroke(Stroke::new(1.0_f32, if selected { CLAY } else { LINE }))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let thumb_size = Vec2::new(54.0, 48.0);
+                ui.add(
+                    egui::Image::new((cover.id(), cover_size))
+                        .fit_to_exact_size(thumb_size)
+                        .uv(cover_uv(cover_size, thumb_size))
+                        .rounding(Rounding::same(6.0)),
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    if ui
+                        .add_sized(
+                            Vec2::new(ui.available_width(), 24.0),
+                            egui::Button::new(
+                                RichText::new("Firing Range")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(TEXT),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        clicked = true;
+                    }
+                    ui.label(RichText::new("AVAILABLE NOW").size(9.0).strong().color(OK));
+                });
+            });
+        });
+    clicked
+}
+
+fn cover_uv(image_size: Vec2, target_size: Vec2) -> Rect {
+    let image_aspect = image_size.x / image_size.y;
+    let target_aspect = target_size.x / target_size.y;
+    if image_aspect > target_aspect {
+        let visible_width = target_aspect / image_aspect;
+        let crop = (1.0 - visible_width) * 0.5;
+        Rect::from_min_max(Pos2::new(crop, 0.0), Pos2::new(1.0 - crop, 1.0))
+    } else {
+        let visible_height = image_aspect / target_aspect;
+        let crop = (1.0 - visible_height) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
+    }
+}
+
+fn status_pill(ui: &mut egui::Ui, state: GameState) {
+    let background = if state.is_ready() {
+        Color32::from_rgb(31, 43, 36)
+    } else {
+        Color32::from_rgb(48, 39, 31)
+    };
+    egui::Frame::none()
+        .fill(background)
+        .rounding(Rounding::same(20.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.0, state.color());
+                ui.label(
+                    RichText::new(state.status_label())
+                        .size(9.0)
+                        .strong()
+                        .color(state.color()),
+                );
+            });
+        });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameMode {
+    FiringRange,
+}
+
+impl GameMode {
+    fn title(self) -> &'static str {
+        match self {
+            Self::FiringRange => "Firing Range",
         }
     }
 }
@@ -206,26 +513,24 @@ impl GameState {
         matches!(self, Self::Ready { .. })
     }
 
-    fn title(self) -> &'static str {
+    fn sidebar_status(self) -> &'static str {
         match self {
-            Self::Ready { .. } => "Ready to launch",
-            Self::FolderMissing => "Choose your game folder",
-            Self::InvalidFolder => "That isn't the r5rust folder",
-            Self::NoBuild => "No game build found",
+            Self::Ready { .. } => "Build ready",
+            Self::FolderMissing => "Folder not found",
+            Self::InvalidFolder => "Invalid folder",
+            Self::NoBuild => "Build not staged",
         }
     }
 
-    fn detail(self) -> &'static str {
+    fn status_label(self) -> &'static str {
         match self {
             Self::Ready {
                 update_waiting: true,
-            } => "A newer staged build will be applied when you launch.",
+            } => "UPDATE STAGED",
             Self::Ready {
                 update_waiting: false,
-            } => "Your staged build is ready.",
-            Self::FolderMissing => "Select the folder that contains r5rust's play.ps1.",
-            Self::InvalidFolder => "Choose the r5rust project folder; it should contain play.ps1.",
-            Self::NoBuild => "Build and stage the game with tools\\publish.ps1 first.",
+            } => "READY TO PLAY",
+            Self::FolderMissing | Self::InvalidFolder | Self::NoBuild => "SETUP NEEDED",
         }
     }
 
