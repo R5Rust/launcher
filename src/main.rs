@@ -50,9 +50,42 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "R5Rust Launcher",
         options,
-        Box::new(|cc| Ok(Box::new(LauncherApp::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            set_native_icons(cc);
+            Ok(Box::new(LauncherApp::new(&cc.egui_ctx)))
+        }),
     )
 }
+
+/// eframe's `with_icon` only sets the window's small icon (winit `set_window_icon` = ICON_SMALL), so the taskbar
+/// stretched that up and the launcher's taskbar icon looked blurry and unlike the game's. Give Windows both sizes
+/// straight from the exe's embedded multi-size icon.ico (resource 1, build.rs), each picked at the system's size.
+#[cfg(windows)]
+fn set_native_icons(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON, SendMessageW,
+        WM_SETICON,
+    };
+    let Ok(handle) = cc.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+            let px = GetSystemMetrics(metric);
+            // MAKEINTRESOURCE(1)
+            let icon = LoadImageW(module, 1 as _, IMAGE_ICON, px, px, LR_DEFAULTCOLOR);
+            if !icon.is_null() {
+                SendMessageW(hwnd, WM_SETICON, which as usize, icon as isize);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_native_icons(_cc: &eframe::CreationContext<'_>) {}
 
 fn load_window_icon() -> egui::IconData {
     let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
