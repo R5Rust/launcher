@@ -59,7 +59,7 @@ fn main() -> eframe::Result<()> {
 
 /// eframe's `with_icon` only sets the window's small icon (winit `set_window_icon` = ICON_SMALL), so the taskbar
 /// stretched that up and the launcher's taskbar icon looked blurry and unlike the game's. Give Windows both sizes
-/// straight from the exe's embedded multi-size icon.ico (resource 1, build.rs), each picked at the system's size.
+/// straight from the exe's embedded multi-size app-icon.ico (resource 1, build.rs), each picked at the system's size.
 #[cfg(windows)]
 fn set_native_icons(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -88,8 +88,8 @@ fn set_native_icons(cc: &eframe::CreationContext<'_>) {
 fn set_native_icons(_cc: &eframe::CreationContext<'_>) {}
 
 fn load_window_icon() -> egui::IconData {
-    let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
-        .expect("the R5Rust app icon should be available")
+    let icon = image::load_from_memory(include_bytes!("../assets/app-icon.png"))
+        .expect("the launcher's app icon should be available")
         .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     egui::IconData { rgba: icon.into_raw(), width: 256, height: 256 }

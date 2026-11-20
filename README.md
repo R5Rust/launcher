@@ -46,7 +46,9 @@ with it (`taskkill /T`).
 
 Follows R5Regenis' launcher: flat near-black panels, no corner radius except the switch knob, one cyan accent
 (`#3fd8ff`) for the active nav item and Play, Barlow Condensed for the big words, Inter for text, JetBrains Mono for the
-console. Fonts are OFL (`assets\fonts\OFL-*.txt`). The window and exe use the game's `assets\icon.png` / `icon.ico`.
+console. Fonts are OFL (`assets\fonts\OFL-*.txt`). The window, taskbar and exe use the launcher's own icon,
+`assets\app-icon.png` / `app-icon.ico` (the game's white gear+A on a dark square, like R5Flowstate's square launcher icon,
+so it can't be mixed up with the game's brown banner); the rail logo is still the game's banner (`assets\icon.png`).
 
 Ideas taken from the reference launchers: R5Regenis (layout, map art from the install, settings card, first-run card),
 R5Flowstate (Console tab, Play becomes Stop, launch-args preview, plain-sentence status line), R5Reloaded (verify game
