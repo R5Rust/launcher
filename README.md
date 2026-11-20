@@ -44,9 +44,15 @@ with it (`taskkill /T`).
 
 ## Look
 
-Follows R5Regenis' launcher: flat near-black panels, no corner radius except the switch knob, one cyan accent
-(`#3fd8ff`) for the active nav item and Play, Barlow Condensed for the big words, Inter for text, JetBrains Mono for the
-console. Fonts are OFL (`assets\fonts\OFL-*.txt`). The window, taskbar and exe use the launcher's own icon,
+Our own flat style (from R5Regenis' launcher: no corner radius except the switch knob, one cyan accent `#3fd8ff` for the
+active nav item and Play, Barlow Condensed for the big words, Inter for text, JetBrains Mono for the console), made
+lighter and easier to read after R5Flowstate's launcher (2026-11-20; its layout ideas, not its colours): a slate palette
+instead of near-black, the map's loading screen **blurred behind the whole window** with see-through panels over it,
+the sharp picture as an inset map card on Play, section titles in Barlow, every small label about 1 px bigger, option
+buttons raised off their card. Under the map card, **quick chips** (like Flowstate's Server / Client chips): Resolution
+(stretched res presets + custom), Display (fullscreen / windowed, `r5rust.toml`), FPS limit (unlimited, 60..360 +
+custom), Launch (fly mode, show FPS, developer console, open the menu: edits the launch options). `--open-chip=<NAME>`
+holds one chip's menu open for screenshots. Fonts are OFL (`assets\fonts\OFL-*.txt`). The window, taskbar and exe use the launcher's own icon,
 `assets\app-icon.png` / `app-icon.ico` (the game's white gear+A on a dark square, like R5Flowstate's square launcher icon,
 so it can't be mixed up with the game's brown banner); the rail logo is still the game's banner (`assets\icon.png`).
 

@@ -17,15 +17,15 @@ use eframe::egui::{
 };
 use game::{GameSettings, GameState, InstallStatus, InstallView, Job, JobKind, Poller, Snapshot, StepState};
 
-const RAIL: Color32 = Color32::from_rgb(12, 17, 23);
-const BG: Color32 = Color32::from_rgb(10, 14, 19);
-const PANEL: Color32 = Color32::from_rgb(17, 23, 33);
-const RAISED: Color32 = Color32::from_rgb(21, 29, 40);
-const HOVER: Color32 = Color32::from_rgb(26, 35, 49);
-const TEXT: Color32 = Color32::from_rgb(232, 239, 247);
-const SECONDARY: Color32 = Color32::from_rgb(147, 161, 179);
-const MUTED: Color32 = Color32::from_rgb(95, 107, 123);
-const BORDER: Color32 = Color32::from_rgb(25, 33, 44);
+const RAIL: Color32 = Color32::from_rgb(15, 21, 30);
+const BG: Color32 = Color32::from_rgb(20, 27, 38);
+const PANEL: Color32 = Color32::from_rgb(27, 36, 50);
+const RAISED: Color32 = Color32::from_rgb(38, 50, 68);
+const HOVER: Color32 = Color32::from_rgb(48, 62, 84);
+const TEXT: Color32 = Color32::from_rgb(242, 246, 250);
+const SECONDARY: Color32 = Color32::from_rgb(190, 201, 216);
+const MUTED: Color32 = Color32::from_rgb(138, 152, 171);
+const BORDER: Color32 = Color32::from_rgb(52, 66, 88);
 const CYAN: Color32 = Color32::from_rgb(63, 216, 255);
 const CYAN_HI: Color32 = Color32::from_rgb(124, 228, 255);
 const INK: Color32 = Color32::from_rgb(8, 19, 26);
@@ -170,8 +170,14 @@ struct LauncherApp {
     settings: GameSettings,
     /// The map's loading screen from the player's extracted files; nothing of the game ships with the launcher.
     art: Option<(egui::TextureHandle, Vec2)>,
+    /// The same picture blurred: the whole window's backdrop (panels are see-through over it).
+    bg_art: Option<(egui::TextureHandle, Vec2)>,
     art_path: Option<PathBuf>,
-    art_rx: Option<Receiver<Option<egui::ColorImage>>>,
+    art_rx: Option<Receiver<Option<(egui::ColorImage, egui::ColorImage)>>>,
+    /// Display mode (r5rust.toml `fullscreen`) and the custom-value fields of the quick chips.
+    fullscreen: bool,
+    custom_res: [i64; 2],
+    custom_fps: i64,
     logo: egui::TextureHandle,
     /// `--autoplay`: press Play on the first frame it's possible (for scripted tests).
     autoplay: bool,
@@ -227,7 +233,11 @@ impl LauncherApp {
             console_problems_only: false,
             console_on_launch: game::read_flag("console_on_launch.txt"),
             art: None,
+            bg_art: None,
             art_path: None,
+            fullscreen: game::read_fullscreen(&game::load_game_root()),
+            custom_res: [1920, 1080],
+            custom_fps: 200,
             art_rx: None,
             logo,
             autoplay: std::env::args().any(|a| a == "--autoplay"),
@@ -446,16 +456,28 @@ impl LauncherApp {
         if let Some(rx) = &self.art_rx
             && let Ok(image) = rx.try_recv()
         {
-            self.art = image.map(|img| {
-                let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
-                (ctx.load_texture("map-art", img, egui::TextureOptions::LINEAR), size)
-            });
+            let (art, bg) = match image {
+                Some((img, blur)) => {
+                    let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
+                    let bsize = Vec2::new(blur.size[0] as f32, blur.size[1] as f32);
+                    (
+                        Some((ctx.load_texture("map-art", img, egui::TextureOptions::LINEAR), size)),
+                        Some((ctx.load_texture("map-art-blur", blur, egui::TextureOptions::LINEAR), bsize)),
+                    )
+                }
+                None => (None, None),
+            };
+            self.art = art;
+            self.bg_art = bg;
             self.art_rx = None;
         }
         if self.art_rx.is_none() && snap.files.loadscreen != self.art_path {
             self.art_path = snap.files.loadscreen.clone();
             match self.art_path.clone() {
-                None => self.art = None,
+                None => {
+                    self.art = None;
+                    self.bg_art = None;
+                }
                 Some(path) => {
                     let (tx, rx) = mpsc::channel();
                     let ctx = ctx.clone();
@@ -466,7 +488,9 @@ impl LauncherApp {
                             } else {
                                 i
                             };
-                            color_image(i)
+                            // backdrop: blurred small (cheap) and drawn stretched; linear filtering smooths it
+                            let blur = i.resize(480, 270, image::imageops::FilterType::Triangle).blur(9.0);
+                            (color_image(i), color_image(blur))
                         });
                         let _ = tx.send(image);
                         ctx.request_repaint();
@@ -517,6 +541,13 @@ impl eframe::App for LauncherApp {
             self.check_install(ctx, snap.files.assets_root.clone());
         }
         self.sync_install(&snap);
+        let screen = ctx.screen_rect();
+        let backdrop = ctx.layer_painter(egui::LayerId::background());
+        backdrop.rect_filled(screen, Rounding::same(0.0), BG);
+        if let Some((tex, size)) = &self.bg_art {
+            backdrop.image(tex.id(), screen, cover_uv(*size, screen.size()), Color32::WHITE);
+            backdrop.rect_filled(screen, Rounding::same(0.0), glass(BG, 120));
+        }
         let phase = self.phase(&snap);
         let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
         let can_build = matches!(snap.state, GameState::Ready | GameState::NoBuild)
@@ -529,10 +560,10 @@ impl eframe::App for LauncherApp {
         self.rail(ctx, &snap, phase);
         egui::TopBottomPanel::bottom("play-footer")
             .exact_height(FOOTER_H)
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(30.0, 13.0)))
+            .frame(egui::Frame::none().fill(glass(PANEL, 232)).inner_margin(Margin::symmetric(30.0, 13.0)))
             .show(ctx, |ui| action = self.footer(ui, &snap, phase, can_play, can_build));
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(BG).inner_margin(0.0)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(0.0)).show(ctx, |ui| {
             match self.page {
                 Page::Play => browse_clicked = self.play_page(ui, ctx, &snap, phase),
                 Page::Notes => self.notes_page(ui, &snap),
@@ -588,7 +619,7 @@ impl LauncherApp {
         egui::SidePanel::left("launcher-rail")
             .exact_width(RAIL_W)
             .resizable(false)
-            .frame(egui::Frame::none().fill(RAIL).inner_margin(0.0))
+            .frame(egui::Frame::none().fill(glass(RAIL, 214)).inner_margin(0.0))
             .show(ctx, |ui| {
                 ui.add_space(38.0);
                 ui.horizontal(|ui| {
@@ -599,7 +630,7 @@ impl LauncherApp {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.add_space(3.0);
                         ui.label(RichText::new("R5RUST").font(display_font(28.0)).color(TEXT));
-                        ui.label(RichText::new("LAUNCHER").size(9.0).color(MUTED));
+                        ui.label(RichText::new("LAUNCHER").size(10.0).color(MUTED));
                     });
                 });
                 ui.add_space(36.0);
@@ -629,10 +660,10 @@ impl LauncherApp {
                 {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
-                        ui.label(RichText::new(key).size(9.0).color(MUTED));
+                        ui.label(RichText::new(key).size(10.0).color(MUTED));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(24.0);
-                            ui.label(RichText::new(value).size(11.0).monospace().color(SECONDARY));
+                            ui.label(RichText::new(value).size(12.0).monospace().color(SECONDARY));
                         });
                     });
                 }
@@ -646,7 +677,8 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, active: bool, badge: 
     let rect = Rect::from_min_size(slot.min + Vec2::new(10.0, 0.0), Vec2::new(width, 44.0));
     let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered() || active, 0.12);
     let painter = ui.painter();
-    let fill = if active { RAISED } else { mix(RAIL, HOVER, hover) };
+    // over the see-through rail: nothing behind an idle item, a glass fill on hover, solid when active
+    let fill = if active { glass(RAISED, 235) } else { glass(HOVER, (hover * 200.0) as u8) };
     painter.rect_filled(rect, Rounding::same(0.0), fill);
     if active {
         painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), Rounding::same(0.0), CYAN);
@@ -694,11 +726,16 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, active: bool, badge: 
             Pos2::new(rect.right() - 12.0, rect.center().y),
             Align2::RIGHT_CENTER,
             badge,
-            FontId::proportional(9.0),
+            FontId::proportional(10.0),
             color,
         );
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// `c` at `alpha`: the see-through panels over the blurred map art.
+fn glass(c: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -730,15 +767,15 @@ impl LauncherApp {
                     GameState::NoBuild => "NO BUILD YET",
                     GameState::FolderMissing | GameState::InvalidFolder => "SETUP REQUIRED",
                 };
-                ui.label(RichText::new(title).size(10.0).color(MUTED));
+                ui.label(RichText::new(title).size(11.0).color(MUTED));
 
                 let body = |ui: &mut egui::Ui, text: &str| {
-                    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(TEXT)).truncate());
+                    ui.add(egui::Label::new(RichText::new(text).size(14.0).color(TEXT)).truncate());
                 };
                 match (snap.state, snap.current.as_ref().or(snap.next.as_ref())) {
                     (GameState::Ready, Some(build)) => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&build.hash).monospace().size(13.0).color(CYAN));
+                            ui.label(RichText::new(&build.hash).monospace().size(14.0).color(CYAN));
                             body(ui, &build.subject);
                         });
                     }
@@ -782,7 +819,7 @@ impl LauncherApp {
                 } else {
                     (String::new(), MUTED)
                 };
-                ui.add(egui::Label::new(RichText::new(line).size(11.0).color(color)).truncate());
+                ui.add(egui::Label::new(RichText::new(line).size(12.0).color(color)).truncate());
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -837,7 +874,7 @@ impl LauncherApp {
             rect.left_top() + Vec2::new(16.0, 34.0),
             Align2::LEFT_TOP,
             detail,
-            FontId::proportional(10.0),
+            FontId::proportional(11.0),
             detail_color,
         );
         if self.building() {
@@ -913,31 +950,36 @@ impl LauncherApp {
 
     /// Returns true when the files card asked to change the game folder.
     fn play_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &Snapshot, phase: PlayPhase) -> bool {
-        let hero_size = ui.available_size();
-        let (hero, _) = ui.allocate_exact_size(hero_size, Sense::hover());
+        let full = ui.available_rect_before_wrap();
+        ui.allocate_rect(full, Sense::hover());
+        let bar_h = 56.0;
+        let hero = Rect::from_min_max(full.min + Vec2::new(28.0, 48.0), Pos2::new(full.right() - 28.0, full.bottom() - bar_h - 28.0));
+        let bar = Rect::from_min_max(Pos2::new(hero.left(), hero.bottom() + 14.0), Pos2::new(hero.right(), hero.bottom() + 14.0 + bar_h));
         let painter = ui.painter().clone();
         self.paint_hero_background(&painter, hero);
         paint_vertical_scrim(
             &painter,
-            Rect::from_min_max(hero.min, Pos2::new(hero.right(), hero.top() + hero.height() * 0.31)),
-            172,
+            Rect::from_min_max(hero.min, Pos2::new(hero.right(), hero.top() + hero.height() * 0.25)),
+            96,
             0,
         );
         paint_vertical_scrim(
             &painter,
-            Rect::from_min_max(Pos2::new(hero.left(), hero.top() + hero.height() * 0.43), hero.max),
+            Rect::from_min_max(Pos2::new(hero.left(), hero.top() + hero.height() * 0.5), hero.max),
             0,
-            226,
+            196,
         );
         paint_horizontal_scrim(
             &painter,
             Rect::from_min_max(hero.min, Pos2::new(hero.left() + hero.width() * 0.5, hero.bottom())),
-            142,
+            84,
             0,
         );
+        painter.rect_stroke(hero, Rounding::same(0.0), Stroke::new(1.0_f32, glass(Color32::WHITE, 26)));
+        self.quick_bar(ui, bar, phase == PlayPhase::Idle);
 
         // MODES tab
-        let tab = Rect::from_min_size(Pos2::new(hero.left() + 40.0, hero.top() + 42.0), Vec2::new(132.0, 38.0));
+        let tab = Rect::from_min_size(Pos2::new(hero.left() + 32.0, hero.top() + 22.0), Vec2::new(132.0, 38.0));
         let tab_response = ui.interact(tab, egui::Id::new("mode-tab"), Sense::click());
         let tab_color = if tab_response.hovered() || self.mode_menu_open { TEXT } else { SECONDARY };
         painter.text(Pos2::new(tab.left(), tab.top() + 8.0), Align2::LEFT_TOP, "MODES", display_font(18.0), tab_color);
@@ -956,9 +998,9 @@ impl LauncherApp {
         }
 
         // Title block
-        let x = hero.left() + 42.0;
-        let y = hero.bottom() - 168.0;
-        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "TRAINING MODE", FontId::proportional(11.0), CYAN);
+        let x = hero.left() + 34.0;
+        let y = hero.bottom() - 160.0;
+        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "TRAINING MODE", FontId::proportional(12.0), CYAN);
         painter.text(Pos2::new(x - 2.0, y + 14.0), Align2::LEFT_TOP, "FIRING RANGE", display_font(70.0), TEXT);
         painter.text(
             Pos2::new(x + 2.0, y + 92.0),
@@ -1017,6 +1059,137 @@ impl LauncherApp {
         browse
     }
 
+    /// Resolution / display / FPS limit / launch options, one chip each, under the map card. They write the same
+    /// settings as the Settings page (r5rust_settings.toml [graphics], r5rust.toml, launch_args.txt).
+    fn quick_bar(&mut self, ui: &mut egui::Ui, bar: Rect, editable: bool) {
+        let painter = ui.painter().clone();
+        painter.rect_filled(bar, Rounding::same(0.0), glass(PANEL, 222));
+        painter.rect_stroke(bar, Rounding::same(0.0), Stroke::new(1.0_f32, glass(Color32::WHITE, 18)));
+        let inner = bar.shrink2(Vec2::new(10.0, 8.0));
+        let mut err = None;
+        ui.allocate_ui_at_rect(inner, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let g = self.settings.graphics.clone();
+
+                // Resolution (Apex-style stretched res)
+                let res = if g.stretch[0] > 0 { format!("{} x {}", g.stretch[0], g.stretch[1]) } else { "Native".to_owned() };
+                let mut pick_res: Option<[i64; 2]> = None;
+                quick_chip(ui, "RESOLUTION", &res, editable, |ui| {
+                    ui.label(RichText::new("Stretched resolution: the game renders at this size, stretched to the window (like Apex).").size(11.5).color(MUTED));
+                    ui.add_space(4.0);
+                    for (v, label) in [
+                        ([0, 0], "Native (window size)"),
+                        ([1920, 1080], "1920 x 1080"),
+                        ([1728, 1080], "1728 x 1080 (16:10)"),
+                        ([1680, 1050], "1680 x 1050"),
+                        ([1600, 900], "1600 x 900"),
+                        ([1440, 1080], "1440 x 1080 (4:3)"),
+                        ([1300, 1070], "1300 x 1070"),
+                        ([1280, 960], "1280 x 960 (4:3)"),
+                        ([1024, 768], "1024 x 768"),
+                    ] {
+                        if menu_row(ui, label, g.stretch == v) {
+                            pick_res = Some(v);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Custom").size(12.0).color(SECONDARY));
+                        ui.add(egui::DragValue::new(&mut self.custom_res[0]).range(320..=7680).speed(4.0));
+                        ui.label(RichText::new("x").size(12.0).color(MUTED));
+                        ui.add(egui::DragValue::new(&mut self.custom_res[1]).range(240..=4320).speed(4.0));
+                        if flat_button(ui, "APPLY") {
+                            pick_res = Some(self.custom_res);
+                        }
+                    });
+                });
+                if let Some(v) = pick_res {
+                    self.settings.graphics.stretch = v;
+                    err = self.settings.save(&self.game_root).err();
+                    ui.memory_mut(|m| m.close_popup());
+                }
+
+                // Display mode
+                let mut pick_fs: Option<bool> = None;
+                quick_chip(ui, "DISPLAY", if self.fullscreen { "Fullscreen" } else { "Windowed" }, editable, |ui| {
+                    if menu_row(ui, "Fullscreen (borderless)", self.fullscreen) {
+                        pick_fs = Some(true);
+                    }
+                    if menu_row(ui, "Windowed", !self.fullscreen) {
+                        pick_fs = Some(false);
+                    }
+                    ui.label(RichText::new("F11 switches in game.").size(11.5).color(MUTED));
+                });
+                if let Some(on) = pick_fs {
+                    match game::write_fullscreen(&self.game_root, on) {
+                        Ok(()) => self.fullscreen = on,
+                        Err(e) => err = Some(e),
+                    }
+                    ui.memory_mut(|m| m.close_popup());
+                }
+
+                // FPS limit
+                let fps = if g.fps_cap > 0 { format!("{} FPS", g.fps_cap) } else { "Unlimited".to_owned() };
+                let mut pick_fps: Option<i64> = None;
+                quick_chip(ui, "FPS LIMIT", &fps, editable, |ui| {
+                    for (v, label) in [(0, "Unlimited"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")] {
+                        if menu_row(ui, label, g.fps_cap == v) {
+                            pick_fps = Some(v);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Custom").size(12.0).color(SECONDARY));
+                        ui.add(egui::DragValue::new(&mut self.custom_fps).range(30..=1000).speed(1.0));
+                        if flat_button(ui, "APPLY") {
+                            pick_fps = Some(self.custom_fps);
+                        }
+                    });
+                });
+                if let Some(v) = pick_fps {
+                    self.settings.graphics.fps_cap = v;
+                    err = self.settings.save(&self.game_root).err();
+                    ui.memory_mut(|m| m.close_popup());
+                }
+
+                // Launch options: quick toggles that edit the launch-args line
+                const FLAGS: [(&[&str], &str, &str); 4] = [
+                    (&["--fly"], "Fly mode", "free camera, no collision"),
+                    (&["+cl_showfps", "1"], "Show FPS", "frame-rate counter"),
+                    (&["-console"], "Developer console", "opens with the game"),
+                    (&["--menu"], "Open the menu", "the game starts in its menu"),
+                ];
+                let on = FLAGS.iter().filter(|(f, ..)| game::has_launch_flag(&self.launch_args, f[0])).count();
+                let value = if on == 0 { "Default".to_owned() } else { format!("{on} on") };
+                let mut args = self.launch_args.clone();
+                quick_chip(ui, "LAUNCH", &value, true, |ui| {
+                    for (flag, title, hint) in FLAGS {
+                        let mut v = game::has_launch_flag(&args, flag[0]);
+                        if toggle_row(ui, &mut v, title, hint, true) {
+                            args = game::set_launch_flag(&args, flag, v);
+                        }
+                    }
+                    ui.label(RichText::new("More in Settings > Launch options.").size(11.5).color(MUTED));
+                });
+                if args != self.launch_args {
+                    self.launch_args = args;
+                    if let Err(e) = game::write_setting("launch_args.txt", &self.launch_args) {
+                        err = Some(format!("Couldn't save launch options: {e}"));
+                    }
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let note = if editable { "Applies the next time the game starts" } else { "Close the game to change these" };
+                    ui.label(RichText::new(note).size(11.5).color(if editable { MUTED } else { AMBER }));
+                });
+            });
+        });
+        if let Some(e) = err {
+            self.notice = Some((e, Tone::Bad));
+        }
+    }
+
     fn install_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &Snapshot) {
         if let Some(job) = &self.install_job {
             let view = InstallView::parse(&job.marks.lock().unwrap());
@@ -1030,7 +1203,7 @@ impl LauncherApp {
             _ if snap.files.ok() => ("REINSTALL", CYAN, "Rebuild the game files from your Apex install"),
             _ => ("GAME FILES MISSING", AMBER, "Build the Firing Range from your Apex install"),
         };
-        ui.label(RichText::new(kicker).size(10.0).color(kicker_color));
+        ui.label(RichText::new(kicker).size(11.0).color(kicker_color));
         ui.add_space(2.0);
         ui.label(RichText::new(title).size(19.0).color(TEXT));
         ui.add_space(4.0);
@@ -1042,7 +1215,7 @@ impl LauncherApp {
             RichText::new(format!(
                 "{why}R5Rust ships no game files: it makes them from your own copy of Apex, reading its files only (never the running game). Takes about 15 minutes and 5 GB."
             ))
-            .size(12.5)
+            .size(13.5)
             .color(SECONDARY),
         );
         ui.add_space(14.0);
@@ -1111,7 +1284,7 @@ impl LauncherApp {
         } else {
             ("INSTALLED".to_owned(), CYAN)
         };
-        ui.label(RichText::new(kicker).size(10.0).color(color));
+        ui.label(RichText::new(kicker).size(11.0).color(color));
         ui.add_space(2.0);
         let title = match (view.current(), &view.done) {
             (Some((_, s)), _) => s.title.clone(),
@@ -1145,19 +1318,19 @@ impl LauncherApp {
                 StepState::Failed(_) => (RED, "failed".to_owned(), RED),
             };
             p.rect_filled(dot, Rounding::same(0.0), dot_color);
-            p.text(at + Vec2::new(16.0, 1.0), Align2::LEFT_TOP, &step.title, FontId::proportional(12.0), text_color);
+            p.text(at + Vec2::new(16.0, 1.0), Align2::LEFT_TOP, &step.title, FontId::proportional(13.0), text_color);
             p.text(at + Vec2::new(col_w, 1.0), Align2::RIGHT_TOP, right, FontId::monospace(10.0), MUTED);
         }
         ui.add_space(8.0);
         for tool in &view.missing_tools {
-            ui.label(RichText::new(format!("Missing {tool}")).size(11.0).color(AMBER));
+            ui.label(RichText::new(format!("Missing {tool}")).size(12.0).color(AMBER));
         }
         if let Some(why) = view.steps.iter().find_map(|s| if let StepState::Skipped(w) = &s.state { Some(w) } else { None }) {
-            ui.label(RichText::new(format!("Skipped: {why}")).size(11.0).color(AMBER));
+            ui.label(RichText::new(format!("Skipped: {why}")).size(12.0).color(AMBER));
         }
         for line in tail {
             if !line.starts_with("@@") {
-                ui.add(egui::Label::new(RichText::new(line.trim()).monospace().size(10.5).color(MUTED)).truncate());
+                ui.add(egui::Label::new(RichText::new(line.trim()).monospace().size(11.5).color(MUTED)).truncate());
             }
         }
         ui.add_space(10.0);
@@ -1195,7 +1368,7 @@ impl LauncherApp {
         let mut picked = false;
         egui::Frame::none().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).inner_margin(12.0).show(ui, |ui| {
             ui.set_width(312.0);
-            ui.label(RichText::new("GAME MODES").size(10.0).color(MUTED));
+            ui.label(RichText::new("GAME MODES").size(11.0).color(MUTED));
             ui.add_space(8.0);
             let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 74.0), Sense::click());
             let p = ui.painter();
@@ -1215,13 +1388,13 @@ impl LauncherApp {
             }
             let text_x = thumb.right() + 12.0;
             p.text(Pos2::new(text_x, row.top() + 22.0), Align2::LEFT_TOP, "Firing Range", FontId::proportional(14.0), TEXT);
-            p.text(Pos2::new(text_x, row.top() + 45.0), Align2::LEFT_TOP, "SELECTED", FontId::proportional(9.0), CYAN);
+            p.text(Pos2::new(text_x, row.top() + 45.0), Align2::LEFT_TOP, "SELECTED", FontId::proportional(10.0), CYAN);
             picked = response.clicked();
             ui.add_space(9.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.label(RichText::new("MORE MODES").size(9.0).color(MUTED));
-            ui.label(RichText::new("Coming later").size(12.0).color(SECONDARY));
+            ui.label(RichText::new("MORE MODES").size(10.0).color(MUTED));
+            ui.label(RichText::new("Coming later").size(13.0).color(SECONDARY));
         });
         picked
     }
@@ -1264,7 +1437,7 @@ impl LauncherApp {
                 log_rect.center(),
                 Align2::CENTER_CENTER,
                 "OPEN LOG",
-                FontId::proportional(10.0),
+                FontId::proportional(11.0),
                 if log_r.hovered() { TEXT } else { SECONDARY },
             );
             open_log = log_r.clicked();
@@ -1320,17 +1493,17 @@ fn line_color(line: &str) -> Color32 {
 fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.label(RichText::new(title).font(display_font(46.0)).color(TEXT));
     ui.add_space(2.0);
-    ui.label(RichText::new(subtitle).size(13.0).color(SECONDARY));
+    ui.label(RichText::new(subtitle).size(14.0).color(SECONDARY));
     ui.add_space(22.0);
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(9.0), color);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(10.0), color);
     let size = galley.size() + Vec2::new(14.0, 8.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     if filled {
         ui.painter().rect_filled(rect, Rounding::same(0.0), color);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(9.0), INK);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(10.0), INK);
     } else {
         ui.painter().rect_stroke(rect.shrink(0.5), Rounding::same(0.0), Stroke::new(1.0_f32, color));
         ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
@@ -1352,7 +1525,7 @@ impl LauncherApp {
             };
             page_header(ui, "PATCH NOTES", &subtitle);
             if snap.commits.is_empty() {
-                ui.label(RichText::new("No git history in this game folder.").size(13.0).color(MUTED));
+                ui.label(RichText::new("No git history in this game folder.").size(14.0).color(MUTED));
                 return;
             }
             let playing = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("");
@@ -1365,7 +1538,7 @@ impl LauncherApp {
                     if c.day != day {
                         day = &c.day;
                         ui.add_space(if i == 0 { 0.0 } else { 18.0 });
-                        ui.label(RichText::new(&c.day).size(10.0).color(MUTED));
+                        ui.label(RichText::new(&c.day).size(11.0).color(MUTED));
                         ui.add_space(4.0);
                     }
                     let row_top = ui.cursor().min.y;
@@ -1373,16 +1546,16 @@ impl LauncherApp {
                         ui.add_space(2.0);
                         ui.allocate_ui_with_layout(Vec2::new(64.0, 18.0), Layout::left_to_right(Align::Center), |ui| {
                             ui.set_width(64.0);
-                            ui.label(RichText::new(&c.hash).monospace().size(12.0).color(MUTED));
+                            ui.label(RichText::new(&c.hash).monospace().size(13.0).color(MUTED));
                         });
                         let chips_w = 230.0;
                         let text_w = (ui.available_width() - chips_w).max(200.0);
                         ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
                             ui.set_width(text_w);
-                            ui.add(egui::Label::new(RichText::new(&c.subject).size(13.0).color(TEXT)).wrap());
+                            ui.add(egui::Label::new(RichText::new(&c.subject).size(14.0).color(TEXT)).wrap());
                         });
                         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                            ui.label(RichText::new(format!("{}  {}", c.time, c.ago)).size(10.0).color(MUTED));
+                            ui.label(RichText::new(format!("{}  {}", c.time, c.ago)).size(11.0).color(MUTED));
                             ui.add_space(6.0);
                             if same_hash(&c.hash, playing) {
                                 chip(ui, "PLAYING", CYAN, true);
@@ -1432,7 +1605,7 @@ impl LauncherApp {
                 );
                 ui.add_space(8.0);
                 toggle(ui, &mut self.console_problems_only, true);
-                ui.label(RichText::new("Warnings and errors only").size(12.0).color(SECONDARY));
+                ui.label(RichText::new("Warnings and errors only").size(13.0).color(SECONDARY));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if flat_button(ui, "OPEN LOG FILE")
                         && let Err(e) = game::open_path(&log_path)
@@ -1464,7 +1637,7 @@ impl LauncherApp {
                     } else {
                         "No lines match."
                     };
-                    ui.label(RichText::new(msg).size(13.0).color(MUTED));
+                    ui.label(RichText::new(msg).size(14.0).color(MUTED));
                     return;
                 }
                 let row_h = 17.0;
@@ -1480,10 +1653,10 @@ impl LauncherApp {
                                 ui.set_height(row_h);
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 if !prefix.is_empty() {
-                                    let p = RichText::new(prefix).monospace().size(12.0).color(MUTED);
+                                    let p = RichText::new(prefix).monospace().size(13.0).color(MUTED);
                                     ui.add(egui::Label::new(p).extend());
                                 }
-                                let r = RichText::new(rest).monospace().size(12.0).color(line_color(line));
+                                let r = RichText::new(rest).monospace().size(13.0).color(line_color(line));
                                 ui.add(egui::Label::new(r).extend());
                             });
                         }
@@ -1509,13 +1682,75 @@ fn split_log_prefix(line: &str) -> (&str, &str) {
 // Settings
 
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).size(10.0).color(MUTED));
+    ui.label(RichText::new(title).font(display_font(19.0)).color(TEXT));
     ui.add_space(6.0);
-    egui::Frame::none().fill(PANEL).inner_margin(Margin::same(20.0)).show(ui, |ui| {
+    egui::Frame::none()
+        .fill(glass(PANEL, 214))
+        .stroke(Stroke::new(1.0_f32, glass(Color32::WHITE, 16)))
+        .inner_margin(Margin::same(20.0))
+        .show(ui, |ui| {
         ui.set_width(ui.available_width());
         body(ui);
     });
     ui.add_space(22.0);
+}
+
+/// A quick chip: small label, the current value, a caret; a click opens `menu` above it.
+fn quick_chip(ui: &mut egui::Ui, label: &str, value: &str, enabled: bool, menu: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.make_persistent_id(("quick-chip", label));
+    // `--open-chip=<LABEL>`: keep that menu open (screenshots of the menus)
+    if std::env::args().any(|a| a.strip_prefix("--open-chip=").is_some_and(|l| l.eq_ignore_ascii_case(label))) {
+        ui.memory_mut(|m| m.open_popup(id));
+    }
+    let open = ui.memory(|m| m.is_popup_open(id));
+    let lf = FontId::proportional(10.5);
+    let vf = FontId::proportional(14.5);
+    let lw = ui.painter().layout_no_wrap(label.to_owned(), lf.clone(), MUTED).size().x;
+    let vw = ui.painter().layout_no_wrap(value.to_owned(), vf.clone(), TEXT).size().x;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(16.0 + lw + 10.0 + vw + 30.0, 40.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(response.id, enabled && (response.hovered() || open), 0.12);
+    let p = ui.painter();
+    p.rect_filled(rect, Rounding::same(0.0), mix(RAISED, HOVER, hover));
+    if open {
+        p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - 2.0), Vec2::new(rect.width(), 2.0)), Rounding::same(0.0), CYAN);
+    }
+    let cy = rect.center().y;
+    p.text(Pos2::new(rect.left() + 16.0, cy), Align2::LEFT_CENTER, label, lf, MUTED);
+    p.text(Pos2::new(rect.left() + 16.0 + lw + 10.0, cy), Align2::LEFT_CENTER, value, vf, if enabled { TEXT } else { SECONDARY });
+    let c = Pos2::new(rect.right() - 15.0, cy + 1.0);
+    let s = Stroke::new(1.4_f32, if open { CYAN } else { SECONDARY });
+    p.line_segment([c + Vec2::new(-4.0, 2.0), c + Vec2::new(0.0, -2.0)], s);
+    p.line_segment([c + Vec2::new(0.0, -2.0), c + Vec2::new(4.0, 2.0)], s);
+    let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response.on_hover_text("Close the game to change this") };
+    if enabled && response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(id));
+    }
+    egui::popup::popup_above_or_below_widget(
+        ui,
+        id,
+        &response,
+        egui::AboveOrBelow::Above,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(300.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            menu(ui);
+        },
+    );
+}
+
+/// One choice in a chip's menu: full width, a cyan bar when it's the current one. Returns true when clicked.
+fn menu_row(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let p = ui.painter();
+    if r.hovered() {
+        p.rect_filled(rect, Rounding::same(0.0), HOVER);
+    }
+    if selected {
+        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())), Rounding::same(0.0), CYAN);
+    }
+    p.text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.5), if selected { CYAN } else { TEXT });
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// A labelled path with a CHANGE button (sets `pick` when clicked).
@@ -1523,12 +1758,12 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &str, ok: bool, pick: &mut boo
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(64.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
             ui.set_width(64.0);
-            ui.label(RichText::new(label).size(9.5).color(MUTED));
+            ui.label(RichText::new(label).size(10.5).color(MUTED));
         });
         let w = (ui.available_width() - 96.0).max(80.0);
         ui.allocate_ui_with_layout(Vec2::new(w, 22.0), Layout::left_to_right(Align::Center), |ui| {
             ui.set_width(w);
-            ui.add(egui::Label::new(RichText::new(path).monospace().size(12.0).color(if ok { TEXT } else { AMBER })).truncate());
+            ui.add(egui::Label::new(RichText::new(path).monospace().size(13.0).color(if ok { TEXT } else { AMBER })).truncate());
         });
         *pick = flat_button(ui, "CHANGE");
     });
@@ -1537,7 +1772,7 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &str, ok: bool, pick: &mut boo
 
 fn flat_button(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
-        egui::Button::new(RichText::new(text).size(11.0).color(TEXT))
+        egui::Button::new(RichText::new(text).size(12.0).color(TEXT))
             .stroke(Stroke::NONE)
             .rounding(Rounding::same(0.0))
             .min_size(Vec2::new(0.0, 34.0)),
@@ -1585,8 +1820,8 @@ fn toggle_row(ui: &mut egui::Ui, value: &mut bool, title: &str, hint: &str, enab
         ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(RichText::new(title).size(13.0).color(if enabled { TEXT } else { MUTED }));
-            ui.label(RichText::new(hint).size(11.0).color(MUTED));
+            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
+            ui.label(RichText::new(hint).size(12.0).color(MUTED));
         });
     });
     ui.add_space(6.0);
@@ -1599,14 +1834,14 @@ fn choice_row<T: PartialEq + Clone>(ui: &mut egui::Ui, title: &str, value: &mut 
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(170.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
             ui.set_width(170.0);
-            ui.label(RichText::new(title).size(13.0).color(if enabled { TEXT } else { MUTED }));
+            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
         });
         ui.spacing_mut().item_spacing.x = 2.0;
         for (v, label) in options {
             let on = *value == *v;
-            let text = RichText::new(*label).size(11.0).color(if on { BG } else if enabled { TEXT } else { MUTED });
+            let text = RichText::new(*label).size(12.0).color(if on { INK } else if enabled { TEXT } else { MUTED });
             let b = egui::Button::new(text)
-                .fill(if on { if enabled { CYAN } else { MUTED } } else { BG })
+                .fill(if on { if enabled { CYAN } else { MUTED } } else { RAISED })
                 .stroke(Stroke::NONE)
                 .rounding(Rounding::same(0.0))
                 .min_size(Vec2::new(0.0, 26.0));
@@ -1636,7 +1871,7 @@ fn slider_row(
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(170.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
             ui.set_width(170.0);
-            ui.label(RichText::new(title).size(13.0).color(if enabled { TEXT } else { MUTED }));
+            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
         });
         let slider = egui::Slider::new(value, range).step_by(step).show_value(false).trailing_fill(true);
         // A smaller knob drawn as a cyan ring (the rail and the knob share the widget fill in egui).
@@ -1652,7 +1887,7 @@ fn slider_row(
             .inner;
         ui.add_space(10.0);
         let shown = format!("{:.*}{suffix}", decimals, *value);
-        ui.label(RichText::new(shown).monospace().size(13.0).color(if enabled { TEXT } else { MUTED }));
+        ui.label(RichText::new(shown).monospace().size(14.0).color(if enabled { TEXT } else { MUTED }));
         settled = r.drag_stopped() || (r.changed() && !r.dragged());
     });
     ui.add_space(4.0);
@@ -1700,7 +1935,7 @@ impl LauncherApp {
                     } else {
                         "Close the game to change these: it saves its own settings when it exits."
                     };
-                    ui.label(RichText::new(note).size(11.0).color(if editable { MUTED } else { AMBER }));
+                    ui.label(RichText::new(note).size(12.0).color(if editable { MUTED } else { AMBER }));
                 });
 
                 section(ui, "GRAPHICS", |ui| {
@@ -1715,7 +1950,7 @@ impl LauncherApp {
                         save = true;
                     }
                     if g.preset == "custom" {
-                        ui.label(RichText::new("Custom: the knobs below don't match a preset.").size(11.0).color(MUTED));
+                        ui.label(RichText::new("Custom: the knobs below don't match a preset.").size(12.0).color(MUTED));
                     }
                     ui.add_space(6.0);
                     let mut knobs = false;
@@ -1748,7 +1983,7 @@ impl LauncherApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("Lighting and effects always render like Apex: presets only trade detail and resolution. Texture quality applies on the next launch, the rest live in game too (Esc > Video).")
-                            .size(11.0)
+                            .size(12.0)
                             .color(MUTED),
                     );
                 });
@@ -1771,8 +2006,8 @@ impl LauncherApp {
                         .collect::<Vec<_>>()
                         .join(" ");
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("RUNS").size(9.0).color(MUTED));
-                        ui.label(RichText::new(format!("r5rust.exe {args}")).monospace().size(12.0).color(CYAN));
+                        ui.label(RichText::new("RUNS").size(10.0).color(MUTED));
+                        ui.label(RichText::new(format!("r5rust.exe {args}")).monospace().size(13.0).color(CYAN));
                     });
                     ui.add_space(8.0);
                     for (flag, what) in [
@@ -1788,23 +2023,23 @@ impl LauncherApp {
                                 Layout::left_to_right(Align::Center),
                                 |ui| {
                                     ui.set_width(200.0);
-                                    ui.label(RichText::new(flag).monospace().size(11.0).color(TEXT));
+                                    ui.label(RichText::new(flag).monospace().size(12.0).color(TEXT));
                                 },
                             );
-                            ui.label(RichText::new(what).size(11.0).color(MUTED));
+                            ui.label(RichText::new(what).size(12.0).color(MUTED));
                         });
                     }
                 });
 
                 section(ui, "GAME FOLDER", |ui| {
-                    ui.label(RichText::new(self.game_root.display().to_string()).monospace().size(13.0).color(TEXT));
+                    ui.label(RichText::new(self.game_root.display().to_string()).monospace().size(14.0).color(TEXT));
                     let (state, color) = match snap.state {
                         GameState::Ready => ("R5Rust project with a build ready to play", CYAN),
                         GameState::NoBuild => ("R5Rust project, nothing built yet", AMBER),
                         GameState::FolderMissing => ("This folder doesn't exist", RED),
                         GameState::InvalidFolder => ("Not an R5Rust project (no play.ps1)", RED),
                     };
-                    ui.label(RichText::new(state).size(11.0).color(color));
+                    ui.label(RichText::new(state).size(12.0).color(color));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         browse = flat_button(ui, "CHANGE FOLDER");
@@ -1817,20 +2052,20 @@ impl LauncherApp {
                 section(ui, "GAME FILES", |ui| {
                     let f = &snap.files;
                     let dir = f.assets_root.join("maps").join(&f.map);
-                    ui.label(RichText::new(dir.display().to_string()).monospace().size(13.0).color(TEXT));
+                    ui.label(RichText::new(dir.display().to_string()).monospace().size(14.0).color(TEXT));
                     let (state, color) = if f.ok() {
                         ("Map extracted: world, collision, materials and lighting found.".to_owned(), CYAN)
                     } else {
                         let missing = f.missing.join(", ");
                         (format!("Missing {missing}. Install builds them from your own Apex install."), AMBER)
                     };
-                    ui.label(RichText::new(state).size(11.0).color(color));
+                    ui.label(RichText::new(state).size(12.0).color(color));
                     let art = if f.loadscreen.is_some() {
                         "Loading screen found (shown on the Play page)."
                     } else {
                         "No loading screen extracted: the Play page shows a plain backdrop."
                     };
-                    ui.label(RichText::new(art).size(11.0).color(MUTED));
+                    ui.label(RichText::new(art).size(12.0).color(MUTED));
                     ui.add_space(10.0);
                     let (install, install_color) = match &self.install_status {
                         InstallStatus::Checking => ("Checking the install...".to_owned(), MUTED),
@@ -1840,7 +2075,7 @@ impl LauncherApp {
                         InstallStatus::Missing(_) => ("Not installed yet.".to_owned(), AMBER),
                         InstallStatus::Unknown(d) => (format!("Couldn't check the install: {d}"), MUTED),
                     };
-                    ui.label(RichText::new(install).size(11.0).color(install_color));
+                    ui.label(RichText::new(install).size(12.0).color(install_color));
                     ui.add_space(10.0);
                     let mut recheck = false;
                     ui.horizontal(|ui| {
@@ -1863,7 +2098,7 @@ impl LauncherApp {
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("Install builds the files from your Apex install (tools\\install.ps1) and points the game at them (assets_root in r5rust.toml).")
-                            .size(11.0)
+                            .size(12.0)
                             .color(MUTED),
                     );
                 });
@@ -1901,7 +2136,7 @@ impl LauncherApp {
                             "R5Rust Launcher v{}. Play runs play.ps1, which installs a staged build first. Build latest runs tools\\publish.ps1 (cargo build + stage) and never touches the copy you're playing. Press Enter to play from any page.",
                             env!("CARGO_PKG_VERSION")
                         ))
-                        .size(12.0)
+                        .size(13.0)
                         .color(SECONDARY),
                     );
                 });
@@ -2071,6 +2306,7 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
+    style.spacing.menu_margin = Margin::same(8.0);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = BG;

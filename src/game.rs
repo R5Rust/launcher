@@ -261,6 +261,8 @@ pub struct GraphicsSettings {
     pub render_scale: i64,
     pub vsync: bool,
     pub fps_cap: i64,
+    /// Stretched resolution like Apex's (the game renders at this size, stretched to the window); [0, 0] = native.
+    pub stretch: [i64; 2],
 }
 
 pub const PRESETS: [&str; 5] = ["lowest", "low", "medium", "high", "ultra"];
@@ -270,7 +272,7 @@ pub const MODEL_LEVELS: [&str; 3] = ["low", "medium", "high"];
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        let mut g = Self { preset: String::new(), texture_quality: String::new(), model_detail: String::new(), anisotropic: 8, sun_shadows: String::new(), msaa: 4, render_scale: 100, vsync: false, fps_cap: 0 };
+        let mut g = Self { preset: String::new(), texture_quality: String::new(), model_detail: String::new(), anisotropic: 8, sun_shadows: String::new(), msaa: 4, render_scale: 100, vsync: false, fps_cap: 0, stretch: [0, 0] };
         g.apply_preset("high");
         g
     }
@@ -322,6 +324,11 @@ impl GraphicsSettings {
             render_scale: i("render_scale", d.render_scale).clamp(50, 100),
             vsync: t.get("vsync").and_then(|v| v.as_bool()).unwrap_or(d.vsync),
             fps_cap: i("fps_cap", d.fps_cap),
+            stretch: t
+                .get("stretch")
+                .and_then(|v| v.as_array())
+                .and_then(|a| Some([a.get(0)?.as_integer()?, a.get(1)?.as_integer()?]))
+                .unwrap_or(d.stretch),
         }
     }
 
@@ -339,6 +346,10 @@ impl GraphicsSettings {
         t["render_scale"] = toml_edit::value(self.render_scale);
         t["vsync"] = toml_edit::value(self.vsync);
         t["fps_cap"] = toml_edit::value(self.fps_cap);
+        let mut stretch = toml_edit::Array::new();
+        stretch.push(self.stretch[0]);
+        stretch.push(self.stretch[1]);
+        t["stretch"] = toml_edit::value(stretch);
     }
 }
 
@@ -648,6 +659,48 @@ impl Job {
             .or_else(|| lines.iter().rev().find(|l| !l.trim().is_empty()))
             .map(|l| l.trim().to_owned())
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// r5rust.toml: the game's per-machine config (gitignored, next to play.ps1). The launcher edits `fullscreen` in place.
+
+pub fn read_fullscreen(root: &Path) -> bool {
+    fs::read_to_string(root.join("r5rust.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|d| d.get("fullscreen").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+pub fn write_fullscreen(root: &Path, on: bool) -> Result<(), String> {
+    let path = root.join("r5rust.toml");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("r5rust.toml: {e}"))?;
+    doc["fullscreen"] = toml_edit::value(on);
+    fs::write(&path, doc.to_string()).map_err(|e| format!("Couldn't save r5rust.toml: {e}"))
+}
+
+/// Turns a launch option on or off in the launch-args text: `flag` is the option and its values, e.g.
+/// `["+cl_showfps", "1"]`. Removing takes the option and as many following tokens as it has values.
+pub fn set_launch_flag(args: &str, flag: &[&str], on: bool) -> String {
+    let mut tokens = split_args(args);
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].eq_ignore_ascii_case(flag[0]) {
+            let end = (i + flag.len()).min(tokens.len());
+            tokens.drain(i..end);
+        } else {
+            i += 1;
+        }
+    }
+    if on {
+        tokens.extend(flag.iter().map(|s| s.to_string()));
+    }
+    tokens.iter().map(|t| if t.contains(' ') { format!("\"{t}\"") } else { t.clone() }).collect::<Vec<_>>().join(" ")
+}
+
+pub fn has_launch_flag(args: &str, flag: &str) -> bool {
+    split_args(args).iter().any(|t| t.eq_ignore_ascii_case(flag))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1069,6 +1122,30 @@ mod tests {
         let back = GameSettings::load(&root);
         assert_eq!((back.graphics.preset.as_str(), back.graphics.msaa, back.graphics.fps_cap), ("lowest", 1, 144));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launch_flags_toggle_with_their_values() {
+        let a = set_launch_flag("--fov 110", &["+cl_showfps", "1"], true);
+        assert_eq!(a, "--fov 110 +cl_showfps 1");
+        assert!(has_launch_flag(&a, "+cl_showfps"));
+        let a = set_launch_flag(&set_launch_flag(&a, &["--fly"], true), &["+cl_showfps", "1"], false);
+        assert_eq!(a, "--fov 110 --fly");
+        assert_eq!(set_launch_flag(&a, &["--fly"], false), "--fov 110");
+    }
+
+    #[test]
+    fn stretch_round_trips_through_the_graphics_table() {
+        let mut doc: toml_edit::DocumentMut = "[graphics]
+fps_cap = 0
+".parse().unwrap();
+        let mut g = GraphicsSettings::load(&doc);
+        assert_eq!(g.stretch, [0, 0]);
+        g.stretch = [1300, 1070];
+        g.fps_cap = 240;
+        g.save(&mut doc);
+        let back = GraphicsSettings::load(&doc.to_string().parse().unwrap());
+        assert_eq!((back.stretch, back.fps_cap), ([1300, 1070], 240));
     }
 
     #[test]
