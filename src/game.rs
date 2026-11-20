@@ -1,5 +1,5 @@
 //! Everything the launcher knows about the game folder: its staged builds, its git history, whether the game is
-//! running, and the two long-running jobs it can start (play.ps1 and tools\publish.ps1).
+//! running, and the long-running jobs it can start (play.ps1, tools\publish.ps1 and tools\install.ps1).
 
 use std::{
     env, fs,
@@ -507,11 +507,15 @@ impl Poller {
 pub enum JobKind {
     Play,
     Build,
+    /// tools\install.ps1: builds the game files from the player's own Apex install.
+    Install,
 }
 
 pub struct Job {
     pub started: Instant,
     pub lines: Arc<Mutex<Vec<String>>>,
+    /// The `@@` progress lines (install.ps1's machine-readable output), kept whole: `lines` drops its oldest.
+    pub marks: Arc<Mutex<Vec<String>>>,
     pub log_path: PathBuf,
     child: Child,
     pub exit: Option<Option<i32>>,
@@ -529,6 +533,7 @@ impl Job {
         let script = match kind {
             JobKind::Play => root.join("play.ps1"),
             JobKind::Build => root.join("tools").join("publish.ps1"),
+            JobKind::Install => root.join("tools").join("install.ps1"),
         };
         if !script.is_file() {
             return Err(format!("{} is missing", script.display()));
@@ -552,14 +557,18 @@ impl Job {
         let mut child = command.spawn().map_err(|e| format!("Couldn't start PowerShell 7 (pwsh): {e}"))?;
 
         let lines = Arc::new(Mutex::new(Vec::new()));
+        let marks = Arc::new(Mutex::new(Vec::new()));
         let stdout = child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>);
         let stderr = child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>);
         for stream in [stdout, stderr].into_iter().flatten() {
-            let (lines, log, ctx) = (lines.clone(), log.clone(), ctx.clone());
+            let (lines, marks, log, ctx) = (lines.clone(), marks.clone(), log.clone(), ctx.clone());
             thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     if let Some(file) = log.lock().unwrap().as_mut() {
                         let _ = writeln!(file, "{line}");
+                    }
+                    if line.starts_with("@@") {
+                        marks.lock().unwrap().push(line.clone());
                     }
                     let mut lines = lines.lock().unwrap();
                     lines.push(line);
@@ -568,13 +577,13 @@ impl Job {
                         lines.drain(..cut);
                     }
                     drop(lines);
-                    if kind == JobKind::Build {
+                    if kind != JobKind::Play {
                         ctx.request_repaint();
                     }
                 }
             });
         }
-        Ok(Self { started: Instant::now(), lines, log_path, child, exit: None, ended: None })
+        Ok(Self { started: Instant::now(), lines, marks, log_path, child, exit: None, ended: None })
     }
 
     /// Checks whether the job finished; returns true the first time it sees the exit.
@@ -642,6 +651,176 @@ impl Job {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Install: tools\install.ps1 builds the game files from the player's own Apex install. It prints `@@` lines (see its
+// header) that the launcher turns into a step list and a progress bar.
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepState {
+    Pending,
+    Running,
+    Done(u32),
+    Skipped(String),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstallStep {
+    pub id: String,
+    pub title: String,
+    pub weight: f32,
+    pub state: StepState,
+}
+
+/// What an install job has said so far.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InstallView {
+    pub steps: Vec<InstallStep>,
+    pub apex: Option<String>,
+    pub missing_tools: Vec<String>,
+    /// `@@done`: (succeeded, message)
+    pub done: Option<(bool, String)>,
+}
+
+impl InstallView {
+    pub fn parse(marks: &[String]) -> Self {
+        let mut v = Self::default();
+        for m in marks {
+            let (tag, rest) = m.split_once(' ').unwrap_or((m.as_str(), ""));
+            let (id, why) = rest.split_once(' ').unwrap_or((rest, ""));
+            match tag {
+                "@@apex" => v.apex = Some(rest.to_owned()),
+                "@@tool" => {
+                    let mut parts = rest.splitn(3, ' ');
+                    let (name, ok, detail) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    if ok == "missing" {
+                        v.missing_tools.push(format!("{}: {detail}", name.replace('_', " ")));
+                    }
+                }
+                "@@plan" => {
+                    v.steps = rest
+                        .split('|')
+                        .filter(|p| !p.is_empty())
+                        .filter_map(|p| {
+                            let mut f = p.splitn(3, ':');
+                            let (id, w, title) = (f.next()?, f.next()?, f.next()?);
+                            Some(InstallStep { id: id.into(), title: title.into(), weight: w.parse().unwrap_or(1.0), state: StepState::Pending })
+                        })
+                        .collect();
+                }
+                "@@step" => {
+                    if let Some(s) = Self::step(&mut v, id) {
+                        *s = StepState::Running;
+                    }
+                }
+                "@@ok" => {
+                    if let Some(s) = Self::step(&mut v, id) {
+                        *s = StepState::Done(why.trim().parse().unwrap_or(0));
+                    }
+                }
+                "@@skip" => {
+                    if let Some(s) = Self::step(&mut v, id) {
+                        *s = StepState::Skipped(why.to_owned());
+                    }
+                }
+                "@@fail" => {
+                    if let Some(s) = Self::step(&mut v, id) {
+                        *s = StepState::Failed(why.to_owned());
+                    }
+                }
+                "@@done" => v.done = Some((id == "ok", why.to_owned())),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn step<'a>(v: &'a mut Self, id: &str) -> Option<&'a mut StepState> {
+        v.steps.iter_mut().find(|s| s.id == id).map(|s| &mut s.state)
+    }
+
+    /// Weighted share of the plan that's finished (a running step counts half).
+    pub fn fraction(&self) -> f32 {
+        let total: f32 = self.steps.iter().map(|s| s.weight).sum();
+        if total <= 0.0 {
+            return if self.done.is_some() { 1.0 } else { 0.0 };
+        }
+        let done: f32 = self
+            .steps
+            .iter()
+            .map(|s| match s.state {
+                StepState::Pending => 0.0,
+                StepState::Running => s.weight * 0.5,
+                _ => s.weight,
+            })
+            .sum();
+        done / total
+    }
+
+    pub fn current(&self) -> Option<(usize, &InstallStep)> {
+        self.steps.iter().enumerate().find(|(_, s)| s.state == StepState::Running)
+    }
+}
+
+/// Whether the game files are installed and current (`install.ps1 -Check`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallStatus {
+    Checking,
+    Installed(String),
+    Partial(String),
+    Stale(String),
+    Missing(String),
+    Unknown(String),
+}
+
+fn run_install_script(root: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    let script = root.join("tools").join("install.ps1");
+    if !script.is_file() {
+        return Err(format!("{} is missing (update the game)", script.display()));
+    }
+    let out = quiet("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Couldn't start PowerShell 7 (pwsh): {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect())
+}
+
+/// Reads install.json against the Apex files it came from (file sizes and dates only; never the running game).
+pub fn check_install(root: &Path, assets: &Path) -> InstallStatus {
+    let lines = match run_install_script(root, &["-Check", "-Assets", &assets.to_string_lossy()]) {
+        Ok(l) => l,
+        Err(e) => return InstallStatus::Unknown(e),
+    };
+    let Some(line) = lines.iter().find_map(|l| l.strip_prefix("@@status ")) else {
+        return InstallStatus::Unknown("the installer said nothing".into());
+    };
+    let (kind, detail) = line.split_once(' ').unwrap_or((line, ""));
+    let detail = detail.to_owned();
+    match kind {
+        "installed" => InstallStatus::Installed(detail),
+        "partial" => InstallStatus::Partial(detail),
+        "stale" => InstallStatus::Stale(detail),
+        "missing" => InstallStatus::Missing(detail),
+        _ => InstallStatus::Unknown(line.to_owned()),
+    }
+}
+
+/// Apex installs that have the map (EA app registry, the default folder, Steam libraries), newest first.
+pub fn detect_apex(root: &Path) -> Vec<String> {
+    run_install_script(root, &["-Detect"])
+        .map(|l| l.iter().filter_map(|l| l.strip_prefix("@@apex ")).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// The arguments for an install job.
+pub fn install_args(apex: &str, assets: &str) -> Vec<String> {
+    vec!["-ApexIsClosed".into(), "-Apex".into(), apex.into(), "-Assets".into(), assets.into()]
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Settings, kept as small text files in %APPDATA%\R5Rust Launcher (game_path.txt predates this module).
 
 /// Where a job's output is saved: %APPDATA%\R5Rust Launcher\<name>.
@@ -653,7 +832,7 @@ pub fn data_dir() -> Option<PathBuf> {
     env::var_os("APPDATA").map(|d| PathBuf::from(d).join("R5Rust Launcher"))
 }
 
-fn read_setting(name: &str) -> Option<String> {
+pub fn read_setting(name: &str) -> Option<String> {
     let text = fs::read_to_string(data_dir()?.join(name)).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
@@ -890,6 +1069,35 @@ mod tests {
         let back = GameSettings::load(&root);
         assert_eq!((back.graphics.preset.as_str(), back.graphics.msaa, back.graphics.fps_cap), ("lowest", 1, 144));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_marks_become_steps_and_progress() {
+        let marks: Vec<String> = [
+            "@@apex C:/Apex",
+            "@@tool dxc ok C:/dxc.exe",
+            "@@tool RSX missing build it",
+            "@@plan map:10:Map geometry|sky:2:Sky|reflections:1:Reflections",
+            "@@step map",
+            "@@ok map 412",
+            "@@step sky",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let v = InstallView::parse(&marks);
+        assert_eq!(v.apex.as_deref(), Some("C:/Apex"));
+        assert_eq!(v.missing_tools, vec!["RSX: build it".to_string()]);
+        assert_eq!(v.steps.len(), 3);
+        assert_eq!(v.steps[0].state, StepState::Done(412));
+        assert_eq!(v.current().map(|(i, s)| (i, s.title.as_str())), Some((1, "Sky")));
+        assert!((v.fraction() - 11.0 / 13.0).abs() < 1e-5);
+        let mut more = marks.clone();
+        more.extend(["@@ok sky 30", "@@skip reflections no cubemaps", "@@done ok Installed to D:/x"].map(String::from));
+        let v = InstallView::parse(&more);
+        assert_eq!(v.steps[2].state, StepState::Skipped("no cubemaps".into()));
+        assert_eq!(v.done, Some((true, "Installed to D:/x".into())));
+        assert_eq!(v.fraction(), 1.0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 mod game;
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver},
@@ -15,7 +15,7 @@ use std::{
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
-use game::{GameSettings, GameState, Job, JobKind, Poller, Snapshot};
+use game::{GameSettings, GameState, InstallStatus, InstallView, Job, JobKind, Poller, Snapshot, StepState};
 
 const RAIL: Color32 = Color32::from_rgb(12, 17, 23);
 const BG: Color32 = Color32::from_rgb(10, 14, 19);
@@ -44,7 +44,9 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([1080.0, 680.0])
             .with_decorations(false)
             .with_resizable(true)
-            .with_icon(load_window_icon()),
+            .with_icon(load_window_icon())
+            // `--screenshot=<png>` opens without taking focus, saves one frame and closes (for checking the UI)
+            .with_active(!std::env::args().any(|a| a.starts_with("--screenshot="))),
         ..Default::default()
     };
     eframe::run_native(
@@ -147,6 +149,19 @@ struct LauncherApp {
     stop_requested: bool,
     build_job: Option<Job>,
     build_panel_open: bool,
+    /// tools\install.ps1 (the INSTALL button): builds the game files from the player's own Apex install.
+    install_job: Option<Job>,
+    /// The install card is open over a working install (Settings > Game files > Install / update).
+    install_open: bool,
+    install_status: InstallStatus,
+    install_rx: Option<Receiver<(InstallStatus, Vec<String>)>>,
+    /// Apex installs found on this PC (newest first) and the one the install will read.
+    apex_found: Vec<String>,
+    apex_dir: String,
+    /// Where the files go (defaults to the game's assets_root).
+    install_dir: String,
+    /// The player confirmed Apex is closed (R5Rust never looks at the running game, so it can't check).
+    apex_closed: bool,
     /// Output of the last game session (kept after it ends).
     console: Option<Arc<Mutex<Vec<String>>>>,
     console_filter: String,
@@ -165,6 +180,9 @@ struct LauncherApp {
     restore_rect: Option<Rect>,
     /// `--maximized`: start maximized (to the work area).
     start_maximized: bool,
+    /// `--screenshot=<png>`: save one frame there, then close.
+    screenshot: Option<PathBuf>,
+    frames: u32,
 }
 
 impl LauncherApp {
@@ -195,6 +213,15 @@ impl LauncherApp {
             stop_requested: false,
             build_job: None,
             build_panel_open: false,
+            install_job: None,
+            // `--install`: open the install card on start (scripted tests, screenshots)
+            install_open: std::env::args().any(|a| a == "--install"),
+            install_status: InstallStatus::Checking,
+            install_rx: None,
+            apex_found: Vec::new(),
+            apex_dir: game::read_setting("apex_path.txt").unwrap_or_default(),
+            install_dir: String::new(),
+            apex_closed: false,
             console: game::read_last_log("game.log").map(|l| Arc::new(Mutex::new(l))),
             console_filter: String::new(),
             console_problems_only: false,
@@ -206,6 +233,8 @@ impl LauncherApp {
             autoplay: std::env::args().any(|a| a == "--autoplay"),
             restore_rect: None,
             start_maximized: std::env::args().any(|a| a == "--maximized"),
+            screenshot: std::env::args().find_map(|a| a.strip_prefix("--screenshot=").map(PathBuf::from)),
+            frames: 0,
         }
     }
 
@@ -292,6 +321,61 @@ impl LauncherApp {
         self.build_job.as_ref().is_some_and(Job::running)
     }
 
+    fn installing(&self) -> bool {
+        self.install_job.as_ref().is_some_and(Job::running)
+    }
+
+    /// Asks install.ps1 (off the UI thread) whether the files are current, and which Apex installs it can see.
+    fn check_install(&mut self, ctx: &egui::Context, assets: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let (root, ctx) = (self.game_root.clone(), ctx.clone());
+        thread::spawn(move || {
+            let status = game::check_install(&root, &assets);
+            let apex = game::detect_apex(&root);
+            let _ = tx.send((status, apex));
+            ctx.request_repaint();
+        });
+        self.install_status = InstallStatus::Checking;
+        self.install_rx = Some(rx);
+    }
+
+    fn sync_install(&mut self, snap: &Snapshot) {
+        if let Some(rx) = &self.install_rx
+            && let Ok((status, apex)) = rx.try_recv()
+        {
+            self.install_status = status;
+            self.apex_found = apex;
+            self.install_rx = None;
+            if self.apex_dir.is_empty() || !Path::new(&self.apex_dir).is_dir() {
+                self.apex_dir = self.apex_found.first().cloned().unwrap_or_default();
+            }
+        }
+        if self.install_dir.is_empty() {
+            self.install_dir = snap.files.assets_root.display().to_string();
+        }
+    }
+
+    fn install(&mut self, ctx: &egui::Context) {
+        let args = game::install_args(&self.apex_dir, &self.install_dir);
+        match Job::start(JobKind::Install, &self.game_root, &args, game::log_path("install.log"), ctx.clone()) {
+            Ok(job) => {
+                self.install_job = Some(job);
+                self.install_open = true;
+                self.notice = None;
+                let _ = game::write_setting("apex_path.txt", &self.apex_dir);
+            }
+            Err(error) => self.notice = Some((error, Tone::Bad)),
+        }
+    }
+
+    fn pick_folder(title: &str, start: &str) -> Option<String> {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if Path::new(start).is_dir() {
+            dialog = dialog.set_directory(start);
+        }
+        dialog.pick_folder().map(|p| p.display().to_string())
+    }
+
     fn phase(&self, snap: &Snapshot) -> PlayPhase {
         match &self.play_job {
             Some(job) if job.running() => {
@@ -337,7 +421,22 @@ impl LauncherApp {
             };
             self.poller.refresh();
         }
-        if self.play_job.is_some() || self.building() {
+        if let Some(job) = &mut self.install_job
+            && job.poll()
+        {
+            let view = InstallView::parse(&job.marks.lock().unwrap());
+            if job.succeeded() {
+                self.notice = Some(("Game files installed. Ready to play.".into(), Tone::Good));
+                self.install_job = None;
+                self.install_open = false;
+            } else {
+                let why = view.done.map(|(_, m)| m).or_else(|| job.failure_line()).unwrap_or_else(|| "see the install log".into());
+                self.notice = Some((format!("Install failed: {why}"), Tone::Bad));
+            }
+            self.poller.refresh();
+            self.check_install(ctx, PathBuf::from(&self.install_dir));
+        }
+        if self.play_job.is_some() || self.building() || self.installing() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
@@ -382,14 +481,37 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs(ctx);
+        if let Some(path) = self.screenshot.clone() {
+            self.frames += 1;
+            // once the first install check is back (or after ~10 s)
+            if self.frames > 20 && (self.install_status != InstallStatus::Checking || self.frames == 330) && self.frames < 1000 {
+                self.frames = 1000;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            }
+            let shot = ctx.input(|i| {
+                i.raw.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None })
+            });
+            if let Some(img) = shot {
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                if let Some(buf) = image::RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, rgba) {
+                    let _ = buf.save(&path);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
         if self.start_maximized && ctx.input(|i| i.viewport().outer_rect.is_some()) {
             self.start_maximized = false;
             self.toggle_maximize(ctx);
         }
         let snap = self.poller.get();
         self.sync_art(ctx, &snap);
+        if self.install_status == InstallStatus::Checking && self.install_rx.is_none() {
+            self.check_install(ctx, snap.files.assets_root.clone());
+        }
+        self.sync_install(&snap);
         let phase = self.phase(&snap);
-        let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle;
+        let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
         let can_build = matches!(snap.state, GameState::Ready | GameState::NoBuild)
             && !self.building()
             && self.game_root.join("tools/publish.ps1").is_file();
@@ -634,8 +756,16 @@ impl LauncherApp {
                     ("Playing. Press Stop to quit.".to_owned(), CYAN)
                 } else if phase == PlayPhase::Elsewhere {
                     ("R5Rust is already running (started outside the launcher).".to_owned(), CYAN)
+                } else if let Some(job) = self.install_job.as_ref().filter(|j| j.running()) {
+                    let view = InstallView::parse(&job.marks.lock().unwrap());
+                    match view.current() {
+                        Some((i, s)) => (format!("Installing game files: {} ({}/{}).", s.title, i + 1, view.steps.len()), CYAN),
+                        None => ("Installing game files...".to_owned(), CYAN),
+                    }
                 } else if snap.is_ready() && !snap.files.ok() {
-                    (format!("Game files missing: {}. See Settings > Game files.", snap.files.missing.join(", ")), AMBER)
+                    ("Game files missing: press Install on the Play page.".to_owned(), AMBER)
+                } else if matches!(self.install_status, InstallStatus::Stale(_)) {
+                    ("Apex or the installer changed: update the game files in Settings > Game files.".to_owned(), AMBER)
                 } else if let (Some(next), Some(_)) = (&snap.next, &snap.current) {
                     (format!("Update {} staged. It installs when you press Play.", next.hash), CYAN)
                 } else if let Some(n) = snap.unbuilt.filter(|n| *n > 0) {
@@ -850,39 +980,20 @@ impl LauncherApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
-        // Files missing: one card, one step, like R5Regenis' first-run card.
-        let mut browse = false;
-        if snap.is_ready() && !snap.files.ok() && phase == PlayPhase::Idle {
-            let card = Rect::from_center_size(hero.center() - Vec2::new(0.0, 40.0), Vec2::new(560.0, 196.0));
+        // Game files: one card, like R5Regenis' first-run card. It's the install form until the files are there, the
+        // progress while installing, and comes back from Settings for a reinstall / update.
+        let browse = false;
+        let show = phase == PlayPhase::Idle && (self.install_job.is_some() || self.install_open || (snap.is_ready() && !snap.files.ok()));
+        if show {
+            let card = Rect::from_center_size(hero.center() - Vec2::new(0.0, 30.0), Vec2::new(620.0, 372.0));
             ui.allocate_ui_at_rect(card, |ui| {
                 egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(12, 17, 24, 236))
+                    .fill(Color32::from_rgba_unmultiplied(12, 17, 24, 240))
+                    .stroke(Stroke::new(1.0_f32, BORDER))
                     .inner_margin(Margin::same(26.0))
                     .show(ui, |ui| {
                         ui.set_width(card.width() - 52.0);
-                        ui.label(RichText::new("GAME FILES MISSING").size(10.0).color(AMBER));
-                        ui.add_space(2.0);
-                        ui.label(RichText::new("Extract the map from your Apex install").size(19.0).color(TEXT));
-                        ui.add_space(2.0);
-                        let dir = snap.files.assets_root.join("maps").join(&snap.files.map);
-                        let no_map = snap.files.missing.iter().any(|m| m.starts_with("maps"));
-                        let text = if no_map {
-                            format!("R5Rust ships no game files. It looks for the extracted map in {}, which doesn't exist yet.", dir.display())
-                        } else {
-                            format!("R5Rust ships no game files. {} is missing {}.", dir.display(), snap.files.missing.join(", "))
-                        };
-                        ui.label(
-                            RichText::new(text)
-                            .size(13.0)
-                            .color(SECONDARY),
-                        );
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if flat_button(ui, "OPEN ASSETS FOLDER") {
-                                let _ = game::open_path(&snap.files.assets_root);
-                            }
-                            browse = flat_button(ui, "CHOOSE GAME FOLDER");
-                        });
+                        self.install_card(ui, ctx, snap);
                     });
             });
         }
@@ -897,6 +1008,179 @@ impl LauncherApp {
             }
         }
         browse
+    }
+
+    fn install_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &Snapshot) {
+        if let Some(job) = &self.install_job {
+            let view = InstallView::parse(&job.marks.lock().unwrap());
+            let (running, elapsed, tail, log) = (job.running(), job.elapsed(), job.tail(3), job.log_path.clone());
+            self.install_progress(ui, ctx, &view, running, elapsed, &tail, &log);
+            return;
+        }
+        let (kicker, kicker_color, title) = match &self.install_status {
+            InstallStatus::Stale(_) => ("UPDATE AVAILABLE", AMBER, "Update the game files from your Apex install"),
+            InstallStatus::Partial(_) => ("INSTALL NOT FINISHED", AMBER, "Finish building the game files"),
+            _ if snap.files.ok() => ("REINSTALL", CYAN, "Rebuild the game files from your Apex install"),
+            _ => ("GAME FILES MISSING", AMBER, "Build the Firing Range from your Apex install"),
+        };
+        ui.label(RichText::new(kicker).size(10.0).color(kicker_color));
+        ui.add_space(2.0);
+        ui.label(RichText::new(title).size(19.0).color(TEXT));
+        ui.add_space(4.0);
+        let why = match &self.install_status {
+            InstallStatus::Stale(d) | InstallStatus::Partial(d) => format!("{d}. "),
+            _ => String::new(),
+        };
+        ui.label(
+            RichText::new(format!(
+                "{why}R5Rust ships no game files: it makes them from your own copy of Apex, reading its files only (never the running game). Takes about 15 minutes and 5 GB."
+            ))
+            .size(12.5)
+            .color(SECONDARY),
+        );
+        ui.add_space(14.0);
+
+        let mut pick_apex = false;
+        let mut pick_dir = false;
+        let apex_ok = !self.apex_dir.is_empty() && Path::new(&self.apex_dir).join("paks").join("Win64").is_dir();
+        let checking = self.install_status == InstallStatus::Checking;
+        let apex_text = match (self.apex_dir.is_empty(), checking) {
+            (false, _) => self.apex_dir.clone(),
+            (true, true) => "Looking for Apex...".to_owned(),
+            (true, false) => "Not found: choose the Apex folder".to_owned(),
+        };
+        path_row(ui, "APEX", &apex_text, apex_ok || (checking && self.apex_dir.is_empty()), &mut pick_apex);
+        path_row(ui, "SAVE TO", &self.install_dir, true, &mut pick_dir);
+        ui.add_space(8.0);
+        toggle_row(
+            ui,
+            &mut self.apex_closed,
+            "Apex is closed",
+            "R5Rust never looks at the running game (anti-cheat), so it can't check: close Apex first.",
+            true,
+        );
+        ui.add_space(10.0);
+        let can = apex_ok && self.apex_closed && !self.install_dir.trim().is_empty() && !self.building();
+        let mut start = false;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            let r = big_button(ui, "INSTALL", if can { BigStyle::Primary } else { BigStyle::Off }, can);
+            start = r.clicked() && can;
+            ui.add_space(10.0);
+            if self.install_open && snap.files.ok() {
+                close = flat_button(ui, "CANCEL");
+            }
+        });
+        if pick_apex && let Some(d) = Self::pick_folder("Choose the Apex Legends folder (the one with paks\\Win64)", &self.apex_dir) {
+            self.apex_dir = d;
+        }
+        if pick_dir && let Some(d) = Self::pick_folder("Where should R5Rust put its game files?", &self.install_dir) {
+            self.install_dir = d;
+        }
+        if close {
+            self.install_open = false;
+        }
+        if start {
+            self.install(ctx);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_progress(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        view: &InstallView,
+        running: bool,
+        elapsed: Duration,
+        tail: &[String],
+        log: &Path,
+    ) {
+        let failed = !running && !view.done.as_ref().is_some_and(|d| d.0);
+        let (kicker, color) = if running {
+            (format!("INSTALLING  {}", fmt_duration(elapsed)), CYAN)
+        } else if failed {
+            ("INSTALL FAILED".to_owned(), RED)
+        } else {
+            ("INSTALLED".to_owned(), CYAN)
+        };
+        ui.label(RichText::new(kicker).size(10.0).color(color));
+        ui.add_space(2.0);
+        let title = match (view.current(), &view.done) {
+            (Some((_, s)), _) => s.title.clone(),
+            (None, Some((_, m))) => m.clone(),
+            _ => "Starting...".to_owned(),
+        };
+        ui.add(egui::Label::new(RichText::new(title).size(19.0).color(TEXT)).truncate());
+        ui.add_space(8.0);
+
+        // progress bar (weighted by how long each step takes)
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
+        ui.painter().rect_filled(bar, Rounding::same(0.0), RAISED);
+        let f = view.fraction().clamp(0.0, 1.0);
+        ui.painter().rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * f, bar.height())), Rounding::same(0.0), if failed { RED } else { CYAN });
+        ui.add_space(10.0);
+
+        // the steps, two columns
+        let rows = view.steps.len().div_ceil(2);
+        let col_w = (ui.available_width() - 16.0) / 2.0;
+        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows as f32 * 19.0), Sense::hover());
+        let p = ui.painter();
+        let t = ui.input(|i| i.time) as f32;
+        for (i, step) in view.steps.iter().enumerate() {
+            let at = area.min + Vec2::new((i / rows) as f32 * (col_w + 16.0), (i % rows) as f32 * 19.0);
+            let dot = Rect::from_center_size(at + Vec2::new(4.0, 8.0), Vec2::splat(7.0));
+            let (dot_color, right, text_color) = match &step.state {
+                StepState::Pending => (BORDER, String::new(), MUTED),
+                StepState::Running => (CYAN.gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs()), "working".to_owned(), TEXT),
+                StepState::Done(secs) => (CYAN, format!("{secs}s"), SECONDARY),
+                StepState::Skipped(_) => (AMBER, "skipped".to_owned(), SECONDARY),
+                StepState::Failed(_) => (RED, "failed".to_owned(), RED),
+            };
+            p.rect_filled(dot, Rounding::same(0.0), dot_color);
+            p.text(at + Vec2::new(16.0, 1.0), Align2::LEFT_TOP, &step.title, FontId::proportional(12.0), text_color);
+            p.text(at + Vec2::new(col_w, 1.0), Align2::RIGHT_TOP, right, FontId::monospace(10.0), MUTED);
+        }
+        ui.add_space(8.0);
+        for tool in &view.missing_tools {
+            ui.label(RichText::new(format!("Missing {tool}")).size(11.0).color(AMBER));
+        }
+        if let Some(why) = view.steps.iter().find_map(|s| if let StepState::Skipped(w) = &s.state { Some(w) } else { None }) {
+            ui.label(RichText::new(format!("Skipped: {why}")).size(11.0).color(AMBER));
+        }
+        for line in tail {
+            if !line.starts_with("@@") {
+                ui.add(egui::Label::new(RichText::new(line.trim()).monospace().size(10.5).color(MUTED)).truncate());
+            }
+        }
+        ui.add_space(10.0);
+        let (mut stop, mut retry, mut close, mut open_log) = (false, false, false, false);
+        ui.horizontal(|ui| {
+            if running {
+                stop = flat_button(ui, "STOP");
+            } else {
+                if failed {
+                    retry = flat_button(ui, "TRY AGAIN");
+                }
+                close = flat_button(ui, "CLOSE");
+            }
+            open_log = flat_button(ui, "OPEN LOG");
+        });
+        if running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if open_log {
+            let _ = game::open_path(log);
+        }
+        if stop && let Some(job) = &mut self.install_job {
+            job.stop();
+        }
+        if retry || close {
+            self.install_job = None;
+            if close {
+                self.install_open = false;
+            }
+        }
     }
 
     /// Returns true when the menu should close (a mode was picked).
@@ -1227,6 +1511,23 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(22.0);
 }
 
+/// A labelled path with a CHANGE button (sets `pick` when clicked).
+fn path_row(ui: &mut egui::Ui, label: &str, path: &str, ok: bool, pick: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(64.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(64.0);
+            ui.label(RichText::new(label).size(9.5).color(MUTED));
+        });
+        let w = (ui.available_width() - 96.0).max(80.0);
+        ui.allocate_ui_with_layout(Vec2::new(w, 22.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(w);
+            ui.add(egui::Label::new(RichText::new(path).monospace().size(12.0).color(if ok { TEXT } else { AMBER })).truncate());
+        });
+        *pick = flat_button(ui, "CHANGE");
+    });
+    ui.add_space(4.0);
+}
+
 fn flat_button(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).size(11.0).color(TEXT))
@@ -1514,7 +1815,7 @@ impl LauncherApp {
                         ("Map extracted: world, collision, materials and lighting found.".to_owned(), CYAN)
                     } else {
                         let missing = f.missing.join(", ");
-                        (format!("Missing {missing}. Extract the map with export-map from your own Apex install."), AMBER)
+                        (format!("Missing {missing}. Install builds them from your own Apex install."), AMBER)
                     };
                     ui.label(RichText::new(state).size(11.0).color(color));
                     let art = if f.loadscreen.is_some() {
@@ -1524,17 +1825,37 @@ impl LauncherApp {
                     };
                     ui.label(RichText::new(art).size(11.0).color(MUTED));
                     ui.add_space(10.0);
+                    let (install, install_color) = match &self.install_status {
+                        InstallStatus::Checking => ("Checking the install...".to_owned(), MUTED),
+                        InstallStatus::Installed(d) => (format!("Installed {d}"), MUTED),
+                        InstallStatus::Partial(d) => (format!("Install not finished: {d}"), AMBER),
+                        InstallStatus::Stale(d) => (format!("Update needed: {d}"), AMBER),
+                        InstallStatus::Missing(_) => ("Not installed yet.".to_owned(), AMBER),
+                        InstallStatus::Unknown(d) => (format!("Couldn't check the install: {d}"), MUTED),
+                    };
+                    ui.label(RichText::new(install).size(11.0).color(install_color));
+                    ui.add_space(10.0);
+                    let mut recheck = false;
                     ui.horizontal(|ui| {
+                        let label = if matches!(self.install_status, InstallStatus::Stale(_) | InstallStatus::Partial(_)) { "UPDATE GAME FILES" } else { "INSTALL / REINSTALL" };
+                        if flat_button(ui, label) && !self.installing() {
+                            self.install_open = true;
+                            self.page = Page::Play;
+                        }
                         if flat_button(ui, "OPEN ASSETS FOLDER") {
                             err = game::open_path(&f.assets_root).err();
                         }
                         if flat_button(ui, "CHECK AGAIN") {
                             self.poller.refresh();
+                            recheck = true;
                         }
                     });
+                    if recheck {
+                        self.check_install(ui.ctx(), snap.files.assets_root.clone());
+                    }
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Set R5RUST_ASSETS or assets_root in r5rust.toml to use another folder.")
+                        RichText::new("Install builds the files from your Apex install (tools\\install.ps1) and points the game at them (assets_root in r5rust.toml).")
                             .size(11.0)
                             .color(MUTED),
                     );
