@@ -481,6 +481,13 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs(ctx);
+        // `--install-demo`: run install.ps1 -Demo (made-up progress, touches nothing) to check the install view
+        if self.frames == 0 && self.install_job.is_none() && std::env::args().any(|a| a == "--install-demo") {
+            if let Ok(job) = Job::start(JobKind::Install, &self.game_root, &["-Demo".to_owned()], game::log_path("install-demo.log"), ctx.clone()) {
+                self.install_job = Some(job);
+            }
+            self.frames = self.frames.max(1);
+        }
         if let Some(path) = self.screenshot.clone() {
             self.frames += 1;
             // once the first install check is back (or after ~10 s)

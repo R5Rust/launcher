@@ -18,17 +18,17 @@ cd C:\Code\apps\r5rust-launcher
 cargo run --release
 ```
 
-Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--autoplay` presses Play once it's possible (for scripted
+Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check is back, and closes; `--autoplay` presses Play once it's possible (for scripted
 tests). Press **Enter** on any page to play.
 
 ## Pages
 
 | Page | What's on it |
 |---|---|
-| **Play** | the map's loading screen, MODES menu (Firing Range for now), and a "game files missing" card when the extracted map isn't there |
+| **Play** | the map's loading screen, MODES menu (Firing Range for now), and the **install card** when the game files aren't there (or opened from Settings): Apex folder (found via the EA app / Steam), where to save, an "Apex is closed" confirmation, **INSTALL**; then a step list with a weighted progress bar, Stop / Try again / Open log. It runs the game's `tools\install.ps1` (see the game README) |
 | **Patch Notes** | the game's git log, grouped by day, with PLAYING / STAGED / NOT BUILT chips |
 | **Console** | the game's stdout/stderr, live, with a filter, "warnings and errors only", copy, and open log. Shows the last session after a restart |
-| **Settings** | **Game**: FOV, sensitivity, auto sprint, mantle boost, invert look, written straight into the game's `r5rust_settings.toml` (binds kept; locked while the game runs). **Graphics**: preset (Lowest..Ultra) + texture quality, sun shadows, anisotropic filtering, anti-aliasing, render scale, FPS cap, V-Sync, written to the game's `[graphics]` table (same preset table as the game's `graphics.rs`; touching a knob makes it Custom). **Launch options** with a preview of the exact command line. **Game folder**, **Game files** (checks `world.glb`, `collision.bin`, `materials.json`, `meta.json`), **Launcher** (open Console on launch), log/settings file shortcuts |
+| **Settings** | **Game**: FOV, sensitivity, auto sprint, mantle boost, invert look, written straight into the game's `r5rust_settings.toml` (binds kept; locked while the game runs). **Graphics**: preset (Lowest..Ultra) + texture quality, sun shadows, anisotropic filtering, anti-aliasing, render scale, FPS cap, V-Sync, written to the game's `[graphics]` table (same preset table as the game's `graphics.rs`; touching a knob makes it Custom). **Launch options** with a preview of the exact command line. **Game folder**, **Game files** (checks `world.glb`, `collision.bin`, `materials.json`, `meta.json`; install status from `install.ps1 -Check`: installed / update needed after an Apex patch / not finished; Install / Update button), **Launcher** (open Console on launch), log/settings file shortcuts |
 
 The footer is always there: installed build hash + commit subject, a status line (update staged, N commits not built,
 files missing, playing...), **BUILD LATEST** (runs `tools\publish.ps1`, live log panel, never touches the copy you're
@@ -67,4 +67,7 @@ files).
 
 - Only Firing Range. More modes, a map picker and mods would follow the game.
 - No self-update, no installer: run it from cargo or copy `target\release\r5rust-launcher.exe`.
+- Install builds the map from Apex; the first-person items (R-99, arms, heirlooms, sounds, decals, effects) aren't in
+  it yet. It still needs the dev tools on this PC (RSX fork, extractor, dxc, Python, cargo): bundling them so a
+  friend's PC needs nothing else is the next step (the game's `tools\bin\` is already checked first).
 - The Console is read-only; R5Rust has no console commands yet.
