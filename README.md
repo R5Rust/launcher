@@ -112,7 +112,7 @@ files).
 
 ## Releasing
 
-- **Launcher:** bump `version` in Cargo.toml, build with paths remapped
+- **Launcher:** bump `version` in Cargo.toml, then `pwsh tools\release.ps1 -Publish -Notes 'line','line'`. By hand:
   (`$env:CARGO_TARGET_DIR='D:\R5Rust\_build\launcher'; $env:RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=~ --remap-path-prefix=C:\Code=src"; cargo build --release`),
   then `gh release create v<version> <exe>#R5Rust-Launcher.exe -R R5Rust/launcher` with the asset **named
   `R5Rust-Launcher.exe`** (the download link and the self-updater look for that name / any `.exe`). Installed
