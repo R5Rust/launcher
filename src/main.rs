@@ -424,6 +424,8 @@ struct LauncherApp {
     /// dev mode: Push build (the dialog, its patch notes, and the push job)
     push_open: bool,
     push_notes: String,
+    /// ping the Update Ping role for this push (big updates only; off every time the dialog opens)
+    push_ping: bool,
     push_job: Option<Job>,
     /// frames spent waiting on a scripted --download / --update-launcher in --screenshot mode
     test_wait: u32,
@@ -534,6 +536,7 @@ impl LauncherApp {
             // `--open-push`: open the Push build dialog on start (screenshots)
             push_open: std::env::args().any(|a| a == "--open-push"),
             push_notes: String::new(),
+            push_ping: false,
             push_job: None,
             test_wait: 0,
             presence: presence::Presence::start(),
@@ -1128,6 +1131,7 @@ impl eframe::App for LauncherApp {
         }
         if action.push {
             self.push_open = true;
+            self.push_ping = false;
         }
         if action.play {
             self.launch(ctx);
@@ -1587,6 +1591,13 @@ impl LauncherApp {
                             .desired_rows(6)
                             .desired_width(f32::INFINITY),
                     );
+                    toggle_row(
+                        ui,
+                        &mut self.push_ping,
+                        "Ping players",
+                        "Big updates only: pings everyone with Update Ping. Off, the build is posted quietly.",
+                        true,
+                    );
                     ui.add_space(SP_XS);
                     ui.horizontal(|ui| {
                         push = big_button(ui, "PUSH", BigStyle::Primary, true).clicked();
@@ -1610,7 +1621,11 @@ impl LauncherApp {
             self.notice = Some((format!("Couldn't save the patch notes: {e}"), Tone::Bad));
             return;
         }
-        let args = vec!["-NotesFile".to_owned(), notes.display().to_string()];
+        let mut args = vec!["-NotesFile".to_owned(), notes.display().to_string()];
+        if self.push_ping {
+            args.push("-Ping".to_owned());
+        }
+        self.push_ping = false;
         match Job::start(JobKind::Push, &self.game_root, &args, game::log_path("push.log"), ctx.clone()) {
             Ok(job) => {
                 self.push_job = Some(job);
