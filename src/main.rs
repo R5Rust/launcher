@@ -216,6 +216,21 @@ const MODES: &[ModeDef] = &[ModeDef {
     ],
 }];
 
+/// Maps carousel: tile size, gap, pitch (tile + gap) and the arrow buttons' width.
+const STRIP_TILE_W: f32 = 176.0;
+const STRIP_TILE_H: f32 = 99.0;
+const STRIP_GAP: f32 = 10.0;
+const STRIP_PITCH: f32 = STRIP_TILE_W + STRIP_GAP;
+const STRIP_ARROW: f32 = 30.0;
+
+/// What the maps strip asked for this frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripAction {
+    None,
+    Close,
+    OpenGrid,
+}
+
 /// FPS cap presets (0 = unlimited). Any other value 20..=1000 is a custom cap (the game's own range).
 const FPS_PRESETS: [(i64, &str); 7] =
     [(0, "Unlimited"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")];
@@ -312,8 +327,17 @@ struct LauncherApp {
     mode_menu_open: bool,
     /// Index into MODES.
     mode: usize,
-    /// The maps panel (top right of the map card).
+    /// The maps carousel strip (top right of the map card) and the "All maps" grid over the map card.
     maps_open: bool,
+    maps_grid_open: bool,
+    /// Carousel scroll in tiles: `strip_pos` eases towards `strip_target` (unbounded: the strip loops).
+    strip_pos: f32,
+    strip_target: f32,
+    /// Centre the selected map the next time the strip lays out (set when it opens).
+    strip_center: bool,
+    wheel_acc: f32,
+    /// `--demo-maps=N` (screenshots only): a longer made-up list to show the looping carousel.
+    demo_maps: Option<&'static [MapDef]>,
     /// Loading screens of the current mode's other maps (None: not extracted), loaded off the UI thread on demand.
     thumbs: std::collections::HashMap<String, Option<(egui::TextureHandle, Vec2)>>,
     thumbs_pending: HashSet<String>,
@@ -401,7 +425,14 @@ impl LauncherApp {
         let mut app = Self {
             mode: 0,
             // `--open-maps`: open the maps panel on start (screenshots)
-            maps_open: std::env::args().any(|a| a == "--open-maps"),
+            maps_open: std::env::args().any(|a| a == "--open-maps" || a == "--open-maps-grid"),
+            // `--open-maps-grid`: open the All maps grid on start (screenshots)
+            maps_grid_open: std::env::args().any(|a| a == "--open-maps-grid"),
+            strip_pos: 0.0,
+            strip_target: 0.0,
+            strip_center: true,
+            wheel_acc: 0.0,
+            demo_maps: None,
             thumbs: Default::default(),
             thumbs_pending: HashSet::new(),
             thumbs_tx,
@@ -448,6 +479,22 @@ impl LauncherApp {
             frames: 0,
         };
         if app.screenshot.is_some() {
+            // `--demo-maps=N`: N made-up maps (cycling the real ones' art) to show the looping carousel
+            if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--demo-maps=").and_then(|v| v.parse::<usize>().ok())) {
+                let base = MODES[app.mode].maps;
+                let list: Vec<MapDef> = (0..n.max(1))
+                    .map(|i| {
+                        let b = &base[i % base.len()];
+                        let name: &'static str = Box::leak(format!("Demo map {}", i + 1).into_boxed_str());
+                        MapDef { bsp: b.bsp, name, note: b.note, playable: b.playable }
+                    })
+                    .collect();
+                app.demo_maps = Some(Box::leak(list.into_boxed_slice()));
+            }
+            // `--strip-pos=2.5`: carousel scrolled to that tile offset (mid-scroll screenshots)
+            if let Some(p) = std::env::args().find_map(|a| a.strip_prefix("--strip-pos=").and_then(|v| v.parse::<f32>().ok())) {
+                (app.strip_pos, app.strip_target, app.strip_center) = (p, p, false);
+            }
             // `--preview-fps=180` / `--preview-res=1366x768`: show a value in the UI without saving it (screenshots)
             for arg in std::env::args() {
                 if let Some(v) = arg.strip_prefix("--preview-fps=").and_then(parse_fps) {
@@ -695,8 +742,8 @@ impl LauncherApp {
         if !self.maps_open {
             return;
         }
-        for map in MODES[self.mode].maps {
-            if map.bsp == snap.files.map || self.thumbs.contains_key(map.bsp) || self.thumbs_pending.contains(map.bsp) {
+        for map in self.maps() {
+            if self.thumbs.contains_key(map.bsp) || self.thumbs_pending.contains(map.bsp) {
                 continue;
             }
             self.thumbs_pending.insert(map.bsp.to_owned());
@@ -704,7 +751,8 @@ impl LauncherApp {
             thread::spawn(move || {
                 let img = game::loadscreen_for(&assets, &bsp)
                     .and_then(|p| image::open(p).ok())
-                    .map(|i| color_image(i.resize(640, 360, image::imageops::FilterType::Triangle)));
+                    // about twice the biggest tile, so the (mipmap-less) downscale stays clean
+                    .map(|i| color_image(i.resize_to_fill(512, 288, image::imageops::FilterType::Lanczos3)));
                 let _ = tx.send((bsp, img));
                 ctx.request_repaint();
             });
@@ -903,6 +951,7 @@ enum Icon {
     ChevronDown,
     ChevronUp,
     ChevronRight,
+    ChevronLeft,
     Close,
     Doc,
     Folder,
@@ -959,6 +1008,9 @@ fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32)
         }
         Icon::ChevronRight => {
             line(vec![v(-2.0, -4.5), v(2.5, 0.0), v(-2.0, 4.5)]);
+        }
+        Icon::ChevronLeft => {
+            line(vec![v(2.0, -4.5), v(-2.5, 0.0), v(2.0, 4.5)]);
         }
         Icon::Close => {
             line(vec![v(-5.0, -5.0), v(5.0, 5.0)]);
@@ -1337,19 +1389,22 @@ fn plural(n: u32) -> &'static str {
 impl LauncherApp {
     /// The map art (or a plain placeholder: the launcher ships no game imagery) filling `rect`.
     fn paint_art(&self, ui: &egui::Ui, rect: Rect, rounding: f32) {
-        self.paint_cover(ui, self.art.as_ref(), rect, rounding, Color32::WHITE);
+        self.paint_cover(ui.painter(), self.art.as_ref(), rect, rounding, Color32::WHITE);
     }
 
-    /// `art` covering `rect` (cropped to fill), tinted; the placeholder when there's none.
-    fn paint_cover(&self, ui: &egui::Ui, art: Option<&(egui::TextureHandle, Vec2)>, rect: Rect, rounding: f32, tint: Color32) {
+    /// `art` covering `rect` (cropped to fill), tinted, through `p` (so it honours `p`'s clip); the placeholder when
+    /// there's none.
+    fn paint_cover(&self, p: &egui::Painter, art: Option<&(egui::TextureHandle, Vec2)>, rect: Rect, rounding: f32, tint: Color32) {
         match art {
             Some((tex, size)) => {
-                egui::Image::new((tex.id(), *size)).uv(cover_uv(*size, rect.size())).rounding(rounding).tint(tint).paint_at(ui, rect);
+                let mut shape = egui::epaint::RectShape::filled(rect, Rounding::same(rounding), tint);
+                shape.fill_texture_id = tex.id();
+                shape.uv = cover_uv(*size, rect.size());
+                p.add(shape);
             }
             None => {
-                let p = ui.painter();
                 p.rect_filled(rect, Rounding::same(rounding), RAISED);
-                let clip = p.with_clip_rect(rect);
+                let clip = p.with_clip_rect(rect.intersect(p.clip_rect()));
                 let m = rect.height().min(rect.width()) * 0.34;
                 clip.image(
                     self.mark.id(),
@@ -1460,11 +1515,10 @@ impl LauncherApp {
             });
         }
 
-        // Maps: a pill in the top-right corner of the art (like R5Flowstate's "All N maps"), opening the mode's map list
-        let maps = MODES[self.mode].maps;
+        // Maps: a pill in the top-right corner of the art opens the mode's maps as a carousel strip under it; the strip's
+        // "All maps" opens a grid over the whole map card (R5Flowstate's map picker, in our look)
         if !show {
-            let text = format!("All {} maps", maps.len());
-            let galley = painter.layout_no_wrap(text, FontId::proportional(T_BODY - 0.5), TEXT);
+            let galley = painter.layout_no_wrap("Maps".to_owned(), FontId::proportional(T_BODY - 0.5), TEXT);
             let pill_rect = Rect::from_min_size(
                 Pos2::new(hero.right() - SP_XL - (galley.size().x + 48.0), hero.top() + SP_XL + 2.0),
                 Vec2::new(galley.size().x + 48.0, 34.0),
@@ -1482,22 +1536,42 @@ impl LauncherApp {
             let pill_clicked = r.clicked();
             if pill_clicked {
                 self.maps_open = !self.maps_open;
+                self.maps_grid_open = false;
+                self.strip_center = true;
                 self.mode_menu_open = false;
             }
-            if self.maps_open {
-                let w = 2.0 * 272.0 + SP_L + 2.0 * (SP_L + 2.0);
+            let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+            if self.maps_grid_open {
+                let area = egui::Area::new(egui::Id::new("maps-grid"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(hero.min)
+                    .show(ctx, |ui| self.maps_grid(ui, &snap.files.map, hero.size()));
+                if area.inner || esc || (!pill_clicked && area.response.clicked_elsewhere()) {
+                    self.maps_grid_open = false;
+                }
+            } else if self.maps_open {
+                // a looping strip as wide as the card allows; few maps (they fit) shrink it to just those, centred
+                let n = self.maps().len() as f32;
+                let max_inner = (hero.width() - 2.0 * SP_XL).min(920.0) - 2.0 * (SP_M + STRIP_ARROW + SP_S);
+                let content = n * STRIP_PITCH - STRIP_GAP;
+                let looping = content > max_inner;
+                let inner = if looping { max_inner } else { content.max(2.0 * STRIP_PITCH - STRIP_GAP) };
+                let w = inner + 2.0 * (SP_M + STRIP_ARROW + SP_S);
                 let pos = Pos2::new(hero.right() - SP_XL - w, pill_rect.bottom() + SP_S + 2.0);
-                let area = egui::Area::new(egui::Id::new("maps-panel"))
+                let area = egui::Area::new(egui::Id::new("maps-strip"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(pos)
-                    .show(ctx, |ui| self.maps_panel(ui, snap, w));
-                let esc = ctx.input(|i| i.key_pressed(Key::Escape));
-                if area.inner || esc || (!pill_clicked && area.response.clicked_elsewhere()) {
-                    self.maps_open = false;
+                    .show(ctx, |ui| self.map_strip(ui, &snap.files.map, inner, looping));
+                match area.inner {
+                    StripAction::OpenGrid => self.maps_grid_open = true,
+                    StripAction::Close => self.maps_open = false,
+                    StripAction::None if esc || (!pill_clicked && area.response.clicked_elsewhere()) => self.maps_open = false,
+                    StripAction::None => {}
                 }
             }
         } else {
             self.maps_open = false;
+            self.maps_grid_open = false;
         }
 
         if self.mode_menu_open {
@@ -1838,77 +1912,209 @@ impl LauncherApp {
         }
     }
 
-    /// The selected mode's maps as tiles: the one being played is selected, maps that aren't ported yet are dimmed and
-    /// locked. Returns true when the panel should close.
-    fn maps_panel(&self, ui: &mut egui::Ui, snap: &Snapshot, width: f32) -> bool {
-        let mode = &MODES[self.mode];
-        let mut close = false;
-        card_frame(250).inner_margin(Margin::same(SP_L + 2.0)).show(ui, |ui| {
-            ui.set_width(width - 2.0 * (SP_L + 2.0));
+    /// The selected mode's maps (or the `--demo-maps` list in screenshots).
+    fn maps(&self) -> &'static [MapDef] {
+        self.demo_maps.unwrap_or(MODES[self.mode].maps)
+    }
+
+    /// One map tile: art (dimmed when not playable), a shade under the name, the name, a lock badge, and the
+    /// selected / hover outline. Drawn through `p`, so the strip can clip tiles at its edges.
+    fn paint_map_tile(&self, p: &egui::Painter, rect: Rect, map: &MapDef, selected: bool, hover: f32, name_size: f32) {
+        let art = self.thumbs.get(map.bsp).and_then(Option::as_ref).or(if selected { self.art.as_ref() } else { None });
+        let tint = if map.playable { Color32::WHITE } else { Color32::from_gray(92) };
+        self.paint_cover(p, art, rect, R_CTRL, tint);
+        let shade = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + rect.height() * 0.45), rect.max).shrink2(Vec2::new(0.5, 0.0));
+        let dark = Color32::from_rgba_unmultiplied(6, 7, 9, 215);
+        paint_gradient(p, shade, [Color32::TRANSPARENT, Color32::TRANSPARENT, dark, dark]);
+        let pad = (rect.height() * 0.09).clamp(8.0, 14.0);
+        let name_color = if map.playable { TEXT } else { SECONDARY };
+        p.text(rect.left_bottom() + Vec2::new(pad, -pad + 1.0), Align2::LEFT_BOTTOM, map.name, FontId::proportional(name_size), name_color);
+        if !map.playable {
+            let c = Pos2::new(rect.right() - pad - 9.0, rect.top() + pad + 9.0);
+            p.circle(c, 13.0, Color32::from_rgba_unmultiplied(10, 11, 13, 215), Stroke::new(1.0_f32, glass(Color32::WHITE, 40)));
+            paint_icon(p, Icon::Lock, c, 13.0, SECONDARY);
+        }
+        let border = if selected {
+            Stroke::new(2.0_f32, ACCENT)
+        } else {
+            Stroke::new(1.0_f32, glass(Color32::WHITE, (24.0 + hover * 70.0) as u8))
+        };
+        p.rect_stroke(rect, Rounding::same(R_CTRL), border);
+    }
+
+    /// The carousel: header with "All maps", arrows at both ends, mouse wheel, eased scrolling. With more maps than
+    /// fit it loops (slot j shows map j mod n, the scroll position is unbounded); with fewer, they sit centred.
+    fn map_strip(&mut self, ui: &mut egui::Ui, current: &str, inner: f32, looping: bool) -> StripAction {
+        let maps = self.maps();
+        let n = maps.len();
+        let mut action = StripAction::None;
+        card_frame(246).inner_margin(Margin::same(SP_M)).show(ui, |ui| {
+            ui.set_width(inner + 2.0 * (STRIP_ARROW + SP_S));
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(caption(&format!("{} maps", mode.name)).color(SECONDARY));
-                    let ready = mode.maps.iter().filter(|m| m.playable).count();
-                    ui.label(RichText::new(format!("{} maps, {ready} playable", mode.maps.len())).size(T_SMALL).color(MUTED));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                ui.add_space(SP_XS);
+                ui.label(caption(&format!("{} maps", MODES[self.mode].name)).color(SECONDARY));
+                ui.label(RichText::new(n.to_string()).size(T_SMALL).color(MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (rect, r) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
                     if r.hovered() {
                         ui.painter().rect_filled(rect, Rounding::same(R_CTRL), HOVER);
                     }
                     paint_icon(ui.painter(), Icon::Close, rect.center(), 12.0, if r.hovered() { TEXT } else { SECONDARY });
-                    close |= r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        action = StripAction::Close;
+                    }
+                    if ghost_button(ui, "All maps", Some(Icon::Grid)) {
+                        action = StripAction::OpenGrid;
+                    }
                 });
             });
-            ui.add_space(SP_M);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(SP_L, SP_L);
-                for map in mode.maps {
-                    close |= self.map_tile(ui, map, map.bsp == snap.files.map);
+            ui.add_space(SP_S);
+            let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), STRIP_TILE_H + 8.0), Sense::hover());
+            let area = Rect::from_min_max(Pos2::new(row.left() + STRIP_ARROW + SP_S, row.top()), Pos2::new(row.right() - STRIP_ARROW - SP_S, row.bottom()));
+            let tiles_y = row.top() + 5.0;
+
+            // arrows (only live when the strip loops)
+            for (dir, rect, icon) in [
+                (-1.0, Rect::from_min_size(row.min, Vec2::new(STRIP_ARROW, row.height())), Icon::ChevronLeft),
+                (1.0, Rect::from_min_size(Pos2::new(row.right() - STRIP_ARROW, row.top()), Vec2::new(STRIP_ARROW, row.height())), Icon::ChevronRight),
+            ] {
+                let r = ui.interact(rect, ui.id().with(("strip-arrow", dir as i32)), if looping { Sense::click() } else { Sense::hover() });
+                let p = ui.painter();
+                if looping && r.hovered() {
+                    p.rect_filled(rect, Rounding::same(R_CTRL), HOVER);
+                }
+                let color = if !looping { BORDER } else if r.hovered() { TEXT } else { SECONDARY };
+                paint_icon(p, icon, rect.center(), 16.0, color);
+                if looping && r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.strip_target += dir;
+                }
+            }
+
+            let visible = (area.width() / STRIP_PITCH).floor().max(1.0);
+            let selected_index = maps.iter().position(|m| m.bsp == current).unwrap_or(0) as f32;
+            if self.strip_center {
+                self.strip_center = false;
+                let start = if looping { selected_index - ((visible - 1.0) / 2.0).floor() } else { 0.0 };
+                (self.strip_pos, self.strip_target) = (start, start);
+            }
+            if looping {
+                // mouse wheel over the strip: one tile per notch (40 px of trackpad travel)
+                if ui.rect_contains_pointer(row) {
+                    let d = ui.input(|i| i.raw_scroll_delta);
+                    self.wheel_acc += d.y + d.x;
+                    while self.wheel_acc <= -40.0 {
+                        self.strip_target += 1.0;
+                        self.wheel_acc += 40.0;
+                    }
+                    while self.wheel_acc >= 40.0 {
+                        self.strip_target -= 1.0;
+                        self.wheel_acc -= 40.0;
+                    }
+                }
+                // ease towards the target; repaint only while moving
+                let dt = ui.input(|i| i.stable_dt).min(0.05);
+                let gap = self.strip_target - self.strip_pos;
+                if gap.abs() < 0.001 {
+                    self.strip_pos = self.strip_target;
+                } else {
+                    self.strip_pos += gap * (1.0 - (-14.0 * dt).exp());
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            // tiles: slot j at x = (j - pos) * pitch; clipped to the area (with room for the raised selection)
+            let clip = ui.painter().with_clip_rect(area.expand2(Vec2::new(0.0, 4.0)).intersect(ui.clip_rect()));
+            let slots: Vec<(i64, f32)> = if looping {
+                let first = self.strip_pos.floor() as i64 - 1;
+                (first..first + visible as i64 + 3).map(|j| (j, area.left() + (j as f32 - self.strip_pos) * STRIP_PITCH)).collect()
+            } else {
+                let x0 = area.left() + (area.width() - (n as f32 * STRIP_PITCH - STRIP_GAP)) / 2.0;
+                (0..n as i64).map(|j| (j, x0 + j as f32 * STRIP_PITCH)).collect()
+            };
+            for (j, x) in slots {
+                let idx = j.rem_euclid(n as i64) as usize;
+                let map = &maps[idx];
+                let selected = idx as f32 == selected_index && maps[idx].bsp == current;
+                let mut rect = Rect::from_min_size(Pos2::new(x, tiles_y), Vec2::new(STRIP_TILE_W, STRIP_TILE_H));
+                let hit = rect.intersect(area);
+                let r = if hit.width() > 4.0 {
+                    let sense = if map.playable { Sense::click() } else { Sense::hover() };
+                    let r = ui.interact(hit, ui.id().with(("strip-tile", j)), sense);
+                    let r = if map.playable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
+                    Some(r.on_hover_text(map.note))
+                } else {
+                    None
+                };
+                let hover = r.as_ref().map_or(0.0, |r| ui.ctx().animate_bool_with_time(r.id, map.playable && r.hovered(), 0.12));
+                if selected {
+                    rect = rect.translate(Vec2::new(0.0, -3.0));
+                }
+                self.paint_map_tile(&clip, rect, map, selected, hover, T_SMALL + 0.5);
+                if r.is_some_and(|r| map.playable && r.clicked()) {
+                    action = StripAction::Close;
+                }
+            }
+        });
+        action
+    }
+
+    /// "All maps": every map of the mode as a grid over the map card (scrolls when there are many). Returns true
+    /// when it should close (X, or a playable map picked).
+    fn maps_grid(&self, ui: &mut egui::Ui, current: &str, size: Vec2) -> bool {
+        let maps = self.maps();
+        let mut close = false;
+        let selected_index = maps.iter().position(|m| m.bsp == current);
+        card_frame(255).inner_margin(Margin::same(SP_XL)).show(ui, |ui| {
+            let inner = size - Vec2::splat(2.0 * SP_XL);
+            ui.set_min_size(inner);
+            ui.set_max_size(inner);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(caption("Choose map").color(SECONDARY));
+                    let ready = maps.iter().filter(|m| m.playable).count();
+                    ui.label(RichText::new(format!("{}  ·  {} maps, {ready} playable", MODES[self.mode].name, maps.len())).size(T_SMALL).color(MUTED));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                    if r.hovered() {
+                        ui.painter().rect_filled(rect, Rounding::same(R_CTRL), HOVER);
+                    }
+                    paint_icon(ui.painter(), Icon::Close, rect.center(), 13.0, if r.hovered() { TEXT } else { SECONDARY });
+                    close |= r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Close (Esc)").clicked();
+                });
+            });
+            ui.add_space(SP_L);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let w = ui.available_width() - SP_S;
+                let gap = SP_M;
+                let cols = (((w + gap) / (205.0 + gap)).floor() as usize).max(1);
+                let tile_w = (w - gap * (cols - 1) as f32) / cols as f32;
+                let tile_h = (tile_w * 9.0 / 16.0).round();
+                for (r_i, row) in maps.chunks(cols).enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for (c_i, map) in row.iter().enumerate() {
+                            let sense = if map.playable { Sense::click() } else { Sense::hover() };
+                            let (rect, r) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), sense);
+                            let hover = ui.ctx().animate_bool_with_time(r.id, map.playable && r.hovered(), 0.12);
+                            let selected = selected_index == Some(r_i * cols + c_i);
+                            self.paint_map_tile(ui.painter(), rect, map, selected, hover, T_BODY);
+                            if !map.playable {
+                                pill(ui.painter(), rect.left_top() + Vec2::new(12.0, 12.0), Align2::LEFT_TOP, "Coming later", PillStyle::Outline(SECONDARY));
+                            } else if selected {
+                                pill(ui.painter(), rect.left_top() + Vec2::new(12.0, 12.0), Align2::LEFT_TOP, "Selected", PillStyle::Accent);
+                            }
+                            let r = if map.playable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
+                            close |= map.playable && r.on_hover_text(map.note).clicked();
+                        }
+                    });
+                    ui.add_space(gap - SP_S);
                 }
             });
         });
         close
     }
-
-    /// One map: 16:9 art, name, bsp, state. Returns true when a playable map was clicked.
-    fn map_tile(&self, ui: &mut egui::Ui, map: &MapDef, selected: bool) -> bool {
-        let w = 272.0;
-        let art_h = (w * 9.0 / 16.0_f32).round();
-        let sense = if map.playable { Sense::click() } else { Sense::hover() };
-        let (rect, r) = ui.allocate_exact_size(Vec2::new(w, art_h + 58.0), sense);
-        let hover = ui.ctx().animate_bool_with_time(r.id, map.playable && r.hovered(), 0.12);
-        let art_rect = Rect::from_min_size(rect.min, Vec2::new(w, art_h));
-        let art = if selected { self.art.as_ref() } else { self.thumbs.get(map.bsp).and_then(Option::as_ref) };
-        let tint = if map.playable { Color32::WHITE } else { Color32::from_gray(96) };
-        self.paint_cover(ui, art, art_rect, R_CTRL, tint);
-        let p = ui.painter();
-        let border = if selected {
-            Stroke::new(2.0_f32, ACCENT)
-        } else {
-            Stroke::new(1.0_f32, glass(Color32::WHITE, (22.0 + hover * 60.0) as u8))
-        };
-        p.rect_stroke(art_rect, Rounding::same(R_CTRL), border);
-        if !map.playable {
-            let c = art_rect.center();
-            p.circle(c, 20.0, Color32::from_rgba_unmultiplied(10, 11, 13, 210), Stroke::new(1.0_f32, glass(Color32::WHITE, 40)));
-            paint_icon(p, Icon::Lock, c, 16.0, SECONDARY);
-        }
-        let name_y = art_rect.bottom() + SP_M;
-        p.text(Pos2::new(rect.left(), name_y), Align2::LEFT_TOP, map.name, FontId::proportional(T_BODY + 0.5), if map.playable { TEXT } else { SECONDARY });
-        p.text(Pos2::new(rect.left(), name_y + 22.0), Align2::LEFT_TOP, map.bsp, FontId::monospace(11.0), MUTED);
-        let pill_pos = Pos2::new(rect.right(), name_y + 9.0);
-        if selected {
-            pill(p, pill_pos, Align2::RIGHT_CENTER, "Selected", PillStyle::Accent);
-        } else if !map.playable {
-            pill(p, pill_pos, Align2::RIGHT_CENTER, "Coming later", PillStyle::Outline(MUTED));
-        }
-        let r = if map.playable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
-        let r = r.on_hover_text(map.note);
-        map.playable && r.clicked()
-    }
-
     /// Returns true when the menu should close (a mode was picked).
     fn mode_menu(&self, ui: &mut egui::Ui) -> bool {
         let mut picked = false;

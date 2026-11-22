@@ -18,7 +18,7 @@ cd C:\Code\apps\r5rust-launcher
 cargo run --release
 ```
 
-Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--open-maps` opens the maps panel; `--custom-open` reveals the custom FPS / resolution fields; `--preview-fps=180`, `--preview-res=1366x768` and `--preview-input=<text>` (screenshot mode only) show a value without saving it; `--scroll=graphics` scrolls Settings to Graphics; `--autoplay` presses Play once it's possible (for scripted
+Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--open-maps` opens the maps strip, `--open-maps-grid` the All maps grid, `--demo-maps=N` (screenshot mode only) fills the list with N made-up maps to show looping, `--strip-pos=2.5` scrolls the strip; `--custom-open` reveals the custom FPS / resolution fields; `--preview-fps=180`, `--preview-res=1366x768` and `--preview-input=<text>` (screenshot mode only) show a value without saving it; `--scroll=graphics` scrolls Settings to Graphics; `--autoplay` presses Play once it's possible (for scripted
 tests). Press **Enter** on any page to play.
 
 Checking the UI: `--screenshot=<png> --idle` plus `--page=...` / `--install-demo` / `--expand-notes`, one run per page.
@@ -64,8 +64,12 @@ red accent**. The design tokens sit at the top of `src\main.rs` and every page u
 - The rail logo is still the game's banner (`assets\icon.png`), drawn exactly as in v0.2 (Kainz's call). The window,
   taskbar and exe use `assets\app-icon.png` / `app-icon.ico` (the game's white gear+A on a dark square).
 
-**Maps** (top right of the map card, like R5Flowstate's "All N maps"): a pill opens the selected mode's maps as tiles.
-The list is data (`MODES` at the top of `src\main.rs`: mode -> maps with bsp, name, note, playable). Firing Range has
+**Maps** (R5Flowstate's map picker, in our look): the **Maps** pill top right of the map card opens a **carousel strip**
+under it: map tiles with their names, the selected one raised with a red outline, arrows at both ends, mouse wheel
+(one tile per notch), eased scrolling that only repaints while moving. With more maps than fit, it loops (after the
+last comes the first again); with fewer (Firing Range's 2), it shrinks to just those tiles, centred, arrows dimmed.
+**All maps** in the strip opens a **grid** over the map card (every map of the mode, selected outlined, locked ones
+dimmed with a lock and "Coming later"; X or Esc closes, scrolls when there are many). The list is data (`MODES` at the top of `src\main.rs`: mode -> maps with bsp, name, note, playable). Firing Range has
 two: `mp_rr_canyonlands_staging_mu1` (the current range, selected) and `mp_rr_canyonlands_staging` (the original range,
 dimmed and locked as "Coming later" until it's ported). Tile art is each map's loading screen from the player's files
 (`<assets>\images\ui\maps_<bsp>_loadscreen\*.png`, loaded small and off the UI thread when the panel opens); a missing
