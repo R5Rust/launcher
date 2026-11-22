@@ -279,6 +279,7 @@ struct CustomInputs {
 enum Page {
     Play,
     Notes,
+    Mods,
     Console,
     Settings,
 }
@@ -377,6 +378,12 @@ struct LauncherApp {
     backdrop_rx: Option<Receiver<egui::ColorImage>>,
     /// Patch-note days the player opened (the newest one shows its highlights either way).
     notes_open: HashSet<String>,
+    /// Mods page: tab, grid / list view, search text, and the mod lists (empty until the game loads mods).
+    mods_tab: ModsTab,
+    mods_view: ModsView,
+    mods_search: String,
+    installed_mods: Vec<Mod>,
+    browse_mods: Vec<Mod>,
     /// Display mode (r5rust.toml `fullscreen`) and the custom-value fields of the quick chips.
     fullscreen: bool,
     custom: CustomInputs,
@@ -411,6 +418,7 @@ impl LauncherApp {
             Some("notes") => Page::Notes,
             Some("console") => Page::Console,
             Some("settings") => Page::Settings,
+            Some("mods") => Page::Mods,
             _ => Page::Play,
         };
         let (tx, backdrop_rx) = mpsc::channel();
@@ -468,6 +476,12 @@ impl LauncherApp {
             backdrop: None,
             backdrop_rx: Some(backdrop_rx),
             notes_open: HashSet::new(),
+            // `--mods-tab=browse` / `--mods-view=list`: open the Mods page that way (screenshots)
+            mods_tab: if std::env::args().any(|a| a == "--mods-tab=browse") { ModsTab::Browse } else { ModsTab::Installed },
+            mods_view: if std::env::args().any(|a| a == "--mods-view=list") { ModsView::List } else { ModsView::Grid },
+            mods_search: String::new(),
+            installed_mods: Vec::new(),
+            browse_mods: Vec::new(),
             fullscreen: game::read_fullscreen(&game::load_game_root()),
             custom: CustomInputs::default(),
             logo,
@@ -880,6 +894,7 @@ impl eframe::App for LauncherApp {
                 Page::Play => browse_clicked = self.play_page(ui, ctx, &snap, phase),
                 Page::Notes => self.notes_page(ui, &snap),
                 Page::Console => self.console_page(ui, phase),
+                Page::Mods => self.mods_page(ui),
                 Page::Settings => browse_clicked = self.settings_page(ui, &snap, phase),
             }
         });
@@ -960,6 +975,8 @@ enum Icon {
     Refresh,
     Grid,
     Lock,
+    Box,
+    Search,
 }
 
 fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
@@ -1034,6 +1051,15 @@ fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32)
         Icon::Check => {
             line(vec![v(-5.5, 0.5), v(-1.5, 4.5), v(5.5, -4.0)]);
         }
+        Icon::Box => {
+            p.add(egui::Shape::closed_line(vec![v(0.0, -7.0), v(6.5, -3.5), v(6.5, 3.5), v(0.0, 7.0), v(-6.5, 3.5), v(-6.5, -3.5)], s));
+            line(vec![v(-6.5, -3.5), v(0.0, 0.0), v(6.5, -3.5)]);
+            line(vec![v(0.0, 0.0), v(0.0, 7.0)]);
+        }
+        Icon::Search => {
+            p.circle_stroke(v(-1.5, -1.5), 5.0 * k, s);
+            line(vec![v(2.2, 2.2), v(6.5, 6.5)]);
+        }
         Icon::Grid => {
             for (x, y) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
                 p.rect_stroke(Rect::from_center_size(v(x, y), Vec2::splat(5.0 * k)), Rounding::same(1.0 * k), s);
@@ -1098,6 +1124,7 @@ impl LauncherApp {
                 for (page, label, icon, badge) in [
                     (Page::Play, "Play", Icon::Play, None),
                     (Page::Notes, "Patch Notes", Icon::Notes, unbuilt),
+                    (Page::Mods, "Mods", Icon::Box, None),
                     (Page::Console, "Console", Icon::Console, live),
                     (Page::Settings, "Settings", Icon::Gear, None),
                 ] {
@@ -2617,6 +2644,342 @@ fn icon_label(ui: &mut egui::Ui, icon: Icon, text: &str, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0 + galley.size().x, galley.size().y.max(16.0)), Sense::hover());
     paint_icon(ui.painter(), icon, Pos2::new(rect.left() + 7.0, rect.center().y), 14.0, color);
     ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - galley.size().y / 2.0), galley, color);
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Mods: the page is laid out, but the game doesn't load mods yet. Both lists are empty; below the "coming" banner the
+// grid / list shows clearly marked examples (grey skeletons, every action disabled with "Coming soon").
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModsTab {
+    Installed,
+    Browse,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModsView {
+    Grid,
+    List,
+}
+
+/// A mod as the page shows it. Mods are free: there's no price anywhere. Real mods plug into `installed_mods` /
+/// `browse_mods`; both are empty until R5Rust can load them.
+struct Mod {
+    name: String,
+    author: String,
+    version: String,
+    description: String,
+    tags: Vec<String>,
+    enabled: bool,
+}
+
+/// How many example skeletons the empty tabs show.
+const MOD_EXAMPLES: usize = 6;
+const COMING_SOON: &str = "Coming soon: R5Rust doesn't load mods yet";
+
+/// A grey placeholder bar (skeleton text).
+fn skeleton_bar(p: &egui::Painter, min: Pos2, w: f32, h: f32, color: Color32) {
+    p.rect_filled(Rect::from_min_size(min, Vec2::new(w, h)), Rounding::same(h / 2.0), color);
+}
+
+/// A button that can't be pressed yet: muted, hairline border, "Coming soon" on hover.
+fn soon_button(ui: &mut egui::Ui, text: &str, icon: Option<Icon>) -> egui::Response {
+    let galley = caption_galley(ui.painter(), text, T_CAPTION + 0.5, MUTED);
+    let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(galley.size().x + icon_w + 2.0 * SP_M + 2.0, 30.0), Sense::hover());
+    let p = ui.painter();
+    p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), RAISED, Stroke::new(1.0_f32, BORDER));
+    let mut x = rect.left() + SP_M + 1.0;
+    if let Some(icon) = icon {
+        paint_icon(p, icon, Pos2::new(x + 7.0, rect.center().y), 13.0, MUTED);
+        x += icon_w;
+    }
+    p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, MUTED);
+    r.on_hover_text(COMING_SOON)
+}
+
+/// A page tab: display-font label, a muted count, the accent underline when active (like the MODES tab).
+fn page_tab(ui: &mut egui::Ui, label: &str, count: usize, active: bool) -> bool {
+    let font = display_font(T_SECTION + 1.0);
+    let lw = ui.painter().layout_no_wrap(label.to_uppercase(), font.clone(), TEXT).size().x;
+    let count_text = count.to_string();
+    let cw = ui.painter().layout_no_wrap(count_text.clone(), FontId::proportional(T_SMALL), MUTED).size().x;
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(lw + SP_S + cw + 2.0, 40.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(r.id, r.hovered() || active, 0.12);
+    let p = ui.painter();
+    let color = mix(SECONDARY, TEXT, hover);
+    let t = p.text(Pos2::new(rect.left(), rect.center().y - 2.0), Align2::LEFT_CENTER, label.to_uppercase(), font, color);
+    p.text(Pos2::new(t.right() + SP_S, t.center().y + 1.0), Align2::LEFT_CENTER, count_text, FontId::proportional(T_SMALL), MUTED);
+    if active {
+        p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - 3.0), Vec2::new(rect.width(), 3.0)), Rounding::same(1.5), ACCENT);
+    }
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A small square icon button that shows whether it's the current choice (grid / list view).
+fn icon_choice(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> bool {
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(34.0, 32.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(r.id, r.hovered(), 0.1);
+    let p = ui.painter();
+    if on {
+        p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), RAISED, Stroke::new(1.0_f32, Color32::from_rgb(74, 80, 90)));
+    } else if hover > 0.0 {
+        p.rect_filled(rect, Rounding::same(R_CTRL), glass(HOVER, (hover * 200.0) as u8));
+    }
+    paint_icon(p, icon, rect.center(), 15.0, if on { TEXT } else { mix(MUTED, SECONDARY, hover) });
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked()
+}
+
+impl LauncherApp {
+    fn mods_page(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none().inner_margin(PAGE_MARGIN).show(ui, |ui| {
+            page_header(ui, "MODS", "Free add-ons for R5Rust: install them, switch each one on or off.");
+
+            // tabs + view toggle, on a hairline
+            let row = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = SP_XL;
+                    for (tab, label, count) in
+                        [(ModsTab::Installed, "Installed", self.installed_mods.len()), (ModsTab::Browse, "Browse", self.browse_mods.len())]
+                    {
+                        if page_tab(ui, label, count, self.mods_tab == tab) {
+                            self.mods_tab = tab;
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = SP_XS;
+                        if icon_choice(ui, Icon::Notes, self.mods_view == ModsView::List, "List view") {
+                            self.mods_view = ModsView::List;
+                        }
+                        if icon_choice(ui, Icon::Grid, self.mods_view == ModsView::Grid, "Grid view") {
+                            self.mods_view = ModsView::Grid;
+                        }
+                    });
+                })
+                .response
+                .rect;
+            ui.painter().hline(row.x_range(), row.bottom() + 0.5, Stroke::new(1.0_f32, BORDER));
+            ui.add_space(SP_L);
+
+            // search + sort / filter (ready for later: the search box types, the chips are inert)
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SP_XS;
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.mods_search)
+                        .hint_text(RichText::new("Search mods").color(MUTED))
+                        .font(FontId::proportional(T_BODY - 0.5))
+                        .margin(Margin { left: 32.0, right: SP_M, top: 7.0, bottom: 7.0 })
+                        .desired_width(280.0),
+                );
+                // (the response rect is the text area, inside the margin)
+                paint_icon(ui.painter(), Icon::Search, Pos2::new(r.rect.left() - 15.0, r.rect.center().y), 14.0, MUTED);
+                ui.add_space(SP_XL);
+                ui.label(caption("Sort").color(MUTED));
+                ui.add_space(SP_XS);
+                let sorts: &[&str] = match self.mods_tab {
+                    ModsTab::Installed => &["Name", "Recently added"],
+                    ModsTab::Browse => &["Popular", "Newest", "Name"],
+                };
+                for (i, s) in sorts.iter().enumerate() {
+                    segment(ui, s, i == 0, false).on_hover_text(COMING_SOON);
+                }
+                ui.add_space(SP_XL);
+                ui.label(caption("Show").color(MUTED));
+                ui.add_space(SP_XS);
+                let filters: &[&str] = match self.mods_tab {
+                    ModsTab::Installed => &["All", "Enabled", "Disabled"],
+                    ModsTab::Browse => &["All", "Maps", "Gameplay", "Visual"],
+                };
+                for (i, f) in filters.iter().enumerate() {
+                    segment(ui, f, i == 0, false).on_hover_text(COMING_SOON);
+                }
+            });
+            ui.add_space(SP_L);
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width() - SP_S);
+                let tab = self.mods_tab;
+                let list = match tab {
+                    ModsTab::Installed => &self.installed_mods,
+                    ModsTab::Browse => &self.browse_mods,
+                };
+                if list.is_empty() {
+                    self.mods_banner(ui, tab);
+                    ui.add_space(SP_XL);
+                    ui.horizontal(|ui| {
+                        ui.label(caption("Layout preview").color(SECONDARY));
+                        ui.label(RichText::new("Examples only, not real mods.").size(T_SMALL).color(MUTED));
+                    });
+                    ui.add_space(SP_M);
+                }
+                let items: Vec<Option<&Mod>> = if list.is_empty() { vec![None; MOD_EXAMPLES] } else { list.iter().map(Some).collect() };
+                match self.mods_view {
+                    ModsView::Grid => self.mods_grid(ui, &items, tab),
+                    ModsView::List => {
+                        for m in &items {
+                            let w = ui.available_width();
+                            ui.allocate_ui_with_layout(Vec2::new(w, 0.0), Layout::top_down(Align::Min), |ui| self.mod_row(ui, *m, tab));
+                            ui.add_space(SP_S);
+                        }
+                    }
+                }
+                ui.add_space(SP_XL);
+            });
+        });
+    }
+
+    fn mods_banner(&self, ui: &mut egui::Ui, tab: ModsTab) {
+        card_frame(238).inner_margin(Margin::symmetric(SP_XL, SP_L + 2.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SP_L;
+                let (tile, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                ui.painter().rect(tile, Rounding::same(R_CARD), RAISED, Stroke::new(1.0_f32, BORDER));
+                paint_icon(ui.painter(), Icon::Box, tile.center(), 22.0, SECONDARY);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = SP_XS;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Mods are coming in a future update").size(T_TITLE).color(TEXT));
+                        ui.add_space(SP_XS);
+                        ui_pill(ui, "Coming soon", PillStyle::Outline(SECONDARY));
+                    });
+                    let body = match tab {
+                        ModsTab::Installed => "R5Rust doesn't load mods yet. Once it does, the mods you install show up here, each with its own on / off switch.",
+                        ModsTab::Browse => "Nothing to browse yet. When mod support lands, free mods show up here, ready to install with one click.",
+                    };
+                    ui.label(RichText::new(body).size(T_BODY - 0.5).color(SECONDARY));
+                });
+            });
+        });
+    }
+
+    /// Cards in as many columns as fit (min 250 px wide).
+    fn mods_grid(&self, ui: &mut egui::Ui, items: &[Option<&Mod>], tab: ModsTab) {
+        let w = ui.available_width();
+        let gap = SP_L;
+        let cols = (((w + gap) / (250.0 + gap)).floor() as usize).max(1);
+        let card_w = (w - gap * (cols - 1) as f32) / cols as f32;
+        for row in items.chunks(cols) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for m in row {
+                    // its own sub-ui, so the action area inside can't move this row's cursor
+                    ui.allocate_ui_with_layout(Vec2::new(card_w, 0.0), Layout::top_down(Align::Min), |ui| self.mod_card(ui, *m, tab, card_w));
+                }
+            });
+            ui.add_space(gap);
+        }
+    }
+
+    /// A grid card: cover, name, author, description, tags, and the action. `None` = an example skeleton.
+    fn mod_card(&self, ui: &mut egui::Ui, m: Option<&Mod>, tab: ModsTab, w: f32) {
+        let cover_h = (w * 0.42).round();
+        let body_h = 156.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, cover_h + body_h), Sense::hover());
+        let p = ui.painter();
+        p.rect(rect, Rounding::same(R_CARD), glass(PANEL, 238), Stroke::new(1.0_f32, BORDER));
+        let cover = Rect::from_min_size(rect.min, Vec2::new(w, cover_h)).shrink(1.0);
+        p.rect_filled(cover, Rounding { nw: R_CARD, ne: R_CARD, sw: 0.0, se: 0.0 }, RAISED);
+        let m_size = cover_h * 0.42;
+        p.image(
+            self.mark.id(),
+            Rect::from_center_size(cover.center(), Vec2::splat(m_size)),
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::from_white_alpha(18),
+        );
+        let x = rect.left() + SP_L;
+        let mut y = cover.bottom() + SP_M + 2.0;
+        match m {
+            None => {
+                pill(p, cover.left_top() + Vec2::new(SP_M, SP_M), Align2::LEFT_TOP, "Example", PillStyle::Outline(MUTED));
+                skeleton_bar(p, Pos2::new(x, y), w * 0.5, 12.0, HOVER);
+                skeleton_bar(p, Pos2::new(x, y + 20.0), w * 0.28, 8.0, RAISED);
+                skeleton_bar(p, Pos2::new(x, y + 40.0), w - 2.0 * SP_L, 8.0, RAISED);
+                skeleton_bar(p, Pos2::new(x, y + 54.0), (w - 2.0 * SP_L) * 0.7, 8.0, RAISED);
+                for (i, tw) in [46.0, 58.0].into_iter().enumerate() {
+                    let tx = x + i as f32 * (46.0 + SP_XS + 4.0);
+                    p.rect_filled(Rect::from_min_size(Pos2::new(tx, y + 74.0), Vec2::new(tw, 18.0)), Rounding::same(R_CTRL), RAISED);
+                }
+            }
+            Some(m) => {
+                p.text(Pos2::new(x, y), Align2::LEFT_TOP, &m.name, FontId::proportional(T_BODY + 1.0), TEXT);
+                p.text(Pos2::new(x, y + 20.0), Align2::LEFT_TOP, format!("by {}  ·  v{}", m.author, m.version), FontId::proportional(T_SMALL), MUTED);
+                let desc = shorten(&m.description, 90);
+                p.text(Pos2::new(x, y + 40.0), Align2::LEFT_TOP, desc, FontId::proportional(T_SMALL), SECONDARY);
+                let mut tx = x;
+                for tag in m.tags.iter().take(3) {
+                    let r = pill(p, Pos2::new(tx, y + 74.0), Align2::LEFT_TOP, tag, PillStyle::Outline(SECONDARY));
+                    tx = r.right() + SP_XS;
+                }
+            }
+        }
+        y = rect.bottom() - SP_M - 30.0;
+        let action = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w - 2.0 * SP_L, 30.0));
+        ui.allocate_ui_at_rect(action, |ui| {
+            ui.horizontal(|ui| match tab {
+                ModsTab::Installed => {
+                    let mut on = m.is_some_and(|m| m.enabled);
+                    ui.scope(|ui| toggle(ui, &mut on, false)).response.on_hover_text(COMING_SOON);
+                    ui.label(RichText::new(if on { "Enabled" } else { "Disabled" }).size(T_SMALL).color(MUTED));
+                }
+                ModsTab::Browse => {
+                    soon_button(ui, "Install", None);
+                }
+            });
+        });
+    }
+
+    /// A list row: thumbnail, name + author, description, version, and the action. `None` = an example skeleton.
+    fn mod_row(&self, ui: &mut egui::Ui, m: Option<&Mod>, tab: ModsTab) {
+        let w = ui.available_width();
+        let h = 76.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+        let p = ui.painter();
+        p.rect(rect, Rounding::same(R_CARD), glass(PANEL, 238), Stroke::new(1.0_f32, BORDER));
+        let thumb = Rect::from_min_size(rect.min + Vec2::new(SP_M, SP_M), Vec2::new(92.0, h - 2.0 * SP_M));
+        p.rect_filled(thumb, Rounding::same(R_CTRL), RAISED);
+        if m.is_some() {
+            p.image(
+                self.mark.id(),
+                Rect::from_center_size(thumb.center(), Vec2::splat(thumb.height() * 0.6)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::from_white_alpha(18),
+            );
+        }
+        let x = thumb.right() + SP_L;
+        let action_w = 170.0;
+        let text_w = (rect.right() - action_w - x - SP_XL).max(120.0);
+        let cy = rect.center().y;
+        match m {
+            None => {
+                skeleton_bar(p, Pos2::new(x, cy - 22.0), (text_w * 0.32).min(200.0), 11.0, HOVER);
+                skeleton_bar(p, Pos2::new(x + (text_w * 0.32).min(200.0) + SP_S, cy - 20.0), 70.0, 8.0, RAISED);
+                skeleton_bar(p, Pos2::new(x, cy - 1.0), text_w * 0.85, 8.0, RAISED);
+                skeleton_bar(p, Pos2::new(x, cy + 13.0), text_w * 0.55, 8.0, RAISED);
+                skeleton_bar(p, Pos2::new(rect.right() - action_w - SP_XL - 40.0, cy - 4.0), 36.0, 8.0, RAISED);
+                pill(p, thumb.center(), Align2::CENTER_CENTER, "Example", PillStyle::Outline(MUTED));
+            }
+            Some(m) => {
+                let t = p.text(Pos2::new(x, cy - 24.0), Align2::LEFT_TOP, &m.name, FontId::proportional(T_BODY + 0.5), TEXT);
+                p.text(Pos2::new(t.right() + SP_S, cy - 23.0), Align2::LEFT_TOP, format!("by {}", m.author), FontId::proportional(T_SMALL), MUTED);
+                p.text(Pos2::new(x, cy), Align2::LEFT_TOP, shorten(&m.description, 110), FontId::proportional(T_SMALL), SECONDARY);
+                p.text(Pos2::new(rect.right() - action_w - SP_XL, cy), Align2::RIGHT_CENTER, format!("v{}", m.version), FontId::monospace(T_MONO), MUTED);
+            }
+        }
+        let action = Rect::from_min_size(Pos2::new(rect.right() - action_w - SP_M, cy - 15.0), Vec2::new(action_w, 30.0));
+        ui.allocate_ui_at_rect(action, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match tab {
+                ModsTab::Installed => {
+                    let mut on = m.is_some_and(|m| m.enabled);
+                    ui.label(RichText::new(if on { "Enabled" } else { "Disabled" }).size(T_SMALL).color(MUTED));
+                    ui.scope(|ui| toggle(ui, &mut on, false)).response.on_hover_text(COMING_SOON);
+                }
+                ModsTab::Browse => {
+                    soon_button(ui, "Install", None);
+                }
+            });
+        });
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------------
