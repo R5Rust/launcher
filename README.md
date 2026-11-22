@@ -18,7 +18,7 @@ cd C:\Code\apps\r5rust-launcher
 cargo run --release
 ```
 
-Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--open-maps` opens the maps panel; `--autoplay` presses Play once it's possible (for scripted
+Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--open-maps` opens the maps panel; `--custom-open` reveals the custom FPS / resolution fields; `--preview-fps=180`, `--preview-res=1366x768` and `--preview-input=<text>` (screenshot mode only) show a value without saving it; `--scroll=graphics` scrolls Settings to Graphics; `--autoplay` presses Play once it's possible (for scripted
 tests). Press **Enter** on any page to play.
 
 Checking the UI: `--screenshot=<png> --idle` plus `--page=...` / `--install-demo` / `--expand-notes`, one run per page.
@@ -73,6 +73,12 @@ picture gives a plain tile. The original range's picture was put there by hand
 (`D:\R5Rust\assets-retail\images\ui\maps_mp_rr_canyonlands_staging_loadscreen\firing_range_s0.png`); it isn't in this
 repo. Picking a different playable map isn't wired up yet (there's only one).
 
+**FPS cap and resolution take presets or any value**, in Settings > Graphics (segments + a CUSTOM segment) and in
+the Play chips (menu items + "Custom..."). Custom reveals a small number field: FPS 20 to 1000 (0 / "unlimited" = no
+cap), resolution width 320 to 7680 by height 240 to 4320 (the game's own ranges). Enter or clicking away applies;
+invalid text turns the field red and isn't saved. A value equal to a preset lights that preset, any other lights
+"CUSTOM 180". Saved as `fps_cap` / `stretch = [w, h]` in the game's `[graphics]` table, as before.
+
 Under the map card on Play, **quick chips**: Resolution (stretched res presets + custom), Display (fullscreen /
 windowed, `r5rust.toml`), FPS limit (unlimited, 60..360 + custom), Launch (fly mode, show FPS, developer console, open
 the menu: edits the launch options). Fonts are OFL (`assets\fonts\OFL-*.txt`).
@@ -87,7 +93,7 @@ files).
 - `src\game.rs`: everything about the game folder: staged builds (`play\current|next\version.txt`), git history,
   process detection (Toolhelp), the background poller (every 3 s, never on the UI thread), the play/build jobs (output
   drained on threads, written to the log), game settings via `toml_edit`, game-files check.
-- `cargo test --release -- --test-threads=1`: 15 tests (jobs run real `pwsh` scripts in temp folders; they never write
+- `cargo test --release -- --test-threads=1`: 16 tests (jobs run real `pwsh` scripts in temp folders; they never write
   to your `%APPDATA%`).
 
 ## Status / unfinished

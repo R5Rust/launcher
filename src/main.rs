@@ -216,6 +216,50 @@ const MODES: &[ModeDef] = &[ModeDef {
     ],
 }];
 
+/// FPS cap presets (0 = unlimited). Any other value 20..=1000 is a custom cap (the game's own range).
+const FPS_PRESETS: [(i64, &str); 7] =
+    [(0, "Unlimited"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")];
+const FPS_RANGE: std::ops::RangeInclusive<i64> = 20..=1000;
+/// Stretched-resolution presets ([0, 0] = native). Custom: any width x height in the game's range.
+const RES_PRESETS: [([i64; 2], &str); 9] = [
+    ([0, 0], "Native"),
+    ([1920, 1080], "1920 x 1080"),
+    ([1728, 1080], "1728 x 1080"),
+    ([1680, 1050], "1680 x 1050"),
+    ([1600, 900], "1600 x 900"),
+    ([1440, 1080], "1440 x 1080"),
+    ([1300, 1070], "1300 x 1070"),
+    ([1280, 960], "1280 x 960"),
+    ([1024, 768], "1024 x 768"),
+];
+const RES_W: std::ops::RangeInclusive<i64> = 320..=7680;
+const RES_H: std::ops::RangeInclusive<i64> = 240..=4320;
+
+/// "180", "180 fps", "0" / "none" / "unlimited" (= 0). None when out of range or not a number.
+fn parse_fps(text: &str) -> Option<i64> {
+    let t = text.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "none" | "unlimited" | "off") {
+        return Some(0);
+    }
+    let v: i64 = t.trim_end_matches("fps").trim().parse().ok()?;
+    (v == 0 || FPS_RANGE.contains(&v)).then_some(v)
+}
+
+fn parse_dim(text: &str, range: &std::ops::RangeInclusive<i64>) -> Option<i64> {
+    text.trim().parse().ok().filter(|v| range.contains(v))
+}
+
+/// The custom-value fields shared by the Settings rows and the Play chips (one value, edited in either place).
+#[derive(Default)]
+struct CustomInputs {
+    fps_open: bool,
+    fps: String,
+    res_open: bool,
+    res: [String; 2],
+    /// Focus the field on the frame it's revealed.
+    focus: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Play,
@@ -311,8 +355,7 @@ struct LauncherApp {
     notes_open: HashSet<String>,
     /// Display mode (r5rust.toml `fullscreen`) and the custom-value fields of the quick chips.
     fullscreen: bool,
-    custom_res: [i64; 2],
-    custom_fps: i64,
+    custom: CustomInputs,
     /// The rail logo: the game's banner (assets\icon.png), unchanged from v0.2.
     logo: egui::TextureHandle,
     /// The game's gear mark, white on transparent (placeholders when there's no map art).
@@ -355,7 +398,7 @@ impl LauncherApp {
             }
         });
         let (thumbs_tx, thumbs_rx) = mpsc::channel();
-        Self {
+        let mut app = Self {
             mode: 0,
             // `--open-maps`: open the maps panel on start (screenshots)
             maps_open: std::env::args().any(|a| a == "--open-maps"),
@@ -395,8 +438,7 @@ impl LauncherApp {
             backdrop_rx: Some(backdrop_rx),
             notes_open: HashSet::new(),
             fullscreen: game::read_fullscreen(&game::load_game_root()),
-            custom_res: [1920, 1080],
-            custom_fps: 200,
+            custom: CustomInputs::default(),
             logo,
             mark,
             autoplay: std::env::args().any(|a| a == "--autoplay"),
@@ -404,7 +446,33 @@ impl LauncherApp {
             start_maximized: std::env::args().any(|a| a == "--maximized"),
             screenshot: std::env::args().find_map(|a| a.strip_prefix("--screenshot=").map(PathBuf::from)),
             frames: 0,
+        };
+        if app.screenshot.is_some() {
+            // `--preview-fps=180` / `--preview-res=1366x768`: show a value in the UI without saving it (screenshots)
+            for arg in std::env::args() {
+                if let Some(v) = arg.strip_prefix("--preview-fps=").and_then(parse_fps) {
+                    app.settings.graphics.fps_cap = v;
+                }
+                if let Some((w, h)) = arg.strip_prefix("--preview-res=").and_then(|v| v.split_once('x')) {
+                    if let (Some(w), Some(h)) = (parse_dim(w, &RES_W), parse_dim(h, &RES_H)) {
+                        app.settings.graphics.stretch = [w, h];
+                    }
+                }
+            }
         }
+        // `--custom-open`: reveal both custom fields (screenshots)
+        if std::env::args().any(|a| a == "--custom-open") {
+            let g = &app.settings.graphics;
+            let (fps, stretch) = (g.fps_cap, g.stretch);
+            app.custom.toggle_fps(fps);
+            app.custom.toggle_res(stretch);
+            app.custom.focus = false;
+            // `--preview-input=<text>`: what's typed in the FPS field (checking the invalid state in a screenshot)
+            if let Some(text) = std::env::args().find_map(|a| a.strip_prefix("--preview-input=").map(str::to_owned)) {
+                app.custom.fps = text;
+            }
+        }
+        app
     }
 
     fn toggle_maximize(&mut self, ctx: &egui::Context) {
@@ -1458,33 +1526,27 @@ impl LauncherApp {
                 let mut pick_res: Option<[i64; 2]> = None;
                 quick_chip(ui, "Resolution", &res, editable, |ui| {
                     menu_hint(ui, "Stretched resolution: the game renders at this size, stretched to the window (like Apex).");
-                    for (v, label) in [
-                        ([0, 0], "Native (window size)"),
-                        ([1920, 1080], "1920 x 1080"),
-                        ([1728, 1080], "1728 x 1080 (16:10)"),
-                        ([1680, 1050], "1680 x 1050"),
-                        ([1600, 900], "1600 x 900"),
-                        ([1440, 1080], "1440 x 1080 (4:3)"),
-                        ([1300, 1070], "1300 x 1070"),
-                        ([1280, 960], "1280 x 960 (4:3)"),
-                        ([1024, 768], "1024 x 768"),
-                    ] {
+                    for (v, label) in RES_PRESETS {
+                        let label = if v[0] == 0 { "Native (window size)" } else { label };
                         if menu_row(ui, label, g.stretch == v) {
                             pick_res = Some(v);
                         }
                     }
-                    ui.add_space(SP_S);
-                    ui.horizontal(|ui| {
-                        ui.label(caption("Custom").color(MUTED));
-                        ui.add(egui::DragValue::new(&mut self.custom_res[0]).range(320..=7680).speed(4.0));
-                        ui.label(RichText::new("x").size(T_SMALL).color(MUTED));
-                        ui.add(egui::DragValue::new(&mut self.custom_res[1]).range(240..=4320).speed(4.0));
-                        if ghost_button(ui, "Apply", None) {
-                            pick_res = Some(self.custom_res);
+                    let custom_on = !RES_PRESETS.iter().any(|(v, _)| *v == g.stretch);
+                    let label = if custom_on { format!("Custom  {} x {}", g.stretch[0], g.stretch[1]) } else { "Custom...".to_owned() };
+                    if menu_row(ui, &label, custom_on) {
+                        self.custom.toggle_res(g.stretch);
+                    }
+                    if self.custom.res_open {
+                        ui.add_space(SP_XS);
+                        if let Some(v) = self.custom.res_field(ui, true) {
+                            pick_res = Some(v);
                         }
-                    });
+                        ui.add_space(SP_XS);
+                    }
                 });
                 if let Some(v) = pick_res {
+                    self.custom.res_open = false;
                     self.settings.graphics.stretch = v;
                     err = self.settings.save(&self.game_root).err();
                     ui.memory_mut(|m| m.close_popup());
@@ -1513,21 +1575,26 @@ impl LauncherApp {
                 let fps = if g.fps_cap > 0 { format!("{} FPS", g.fps_cap) } else { "Unlimited".to_owned() };
                 let mut pick_fps: Option<i64> = None;
                 quick_chip(ui, "FPS limit", &fps, editable, |ui| {
-                    for (v, label) in [(0, "Unlimited"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")] {
+                    for (v, label) in FPS_PRESETS {
                         if menu_row(ui, label, g.fps_cap == v) {
                             pick_fps = Some(v);
                         }
                     }
-                    ui.add_space(SP_S);
-                    ui.horizontal(|ui| {
-                        ui.label(caption("Custom").color(MUTED));
-                        ui.add(egui::DragValue::new(&mut self.custom_fps).range(30..=1000).speed(1.0));
-                        if ghost_button(ui, "Apply", None) {
-                            pick_fps = Some(self.custom_fps);
+                    let custom_on = !FPS_PRESETS.iter().any(|(v, _)| *v == g.fps_cap);
+                    let label = if custom_on { format!("Custom  {}", g.fps_cap) } else { "Custom...".to_owned() };
+                    if menu_row(ui, &label, custom_on) {
+                        self.custom.toggle_fps(g.fps_cap);
+                    }
+                    if self.custom.fps_open {
+                        ui.add_space(SP_XS);
+                        if let Some(v) = self.custom.fps_field(ui, true) {
+                            pick_fps = Some(v);
                         }
-                    });
+                        ui.add_space(SP_XS);
+                    }
                 });
                 if let Some(v) = pick_fps {
+                    self.custom.fps_open = false;
                     self.settings.graphics.fps_cap = v;
                     err = self.settings.save(&self.game_root).err();
                     ui.memory_mut(|m| m.close_popup());
@@ -2500,13 +2567,16 @@ fn split_log_prefix(line: &str) -> (&str, &str) {
 // Settings and the shared controls
 
 /// A settings group: an accent-barred display title, then a card; `note` is the card's footer strip.
-fn section(ui: &mut egui::Ui, title: &str, note: Option<(&str, Color32)>, body: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
+/// Returns the title row's rect (for scrolling to a section).
+fn section(ui: &mut egui::Ui, title: &str, note: Option<(&str, Color32)>, body: impl FnOnce(&mut egui::Ui)) -> Rect {
+    let head = ui.horizontal(|ui| {
         let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 20.0), Sense::hover());
         ui.painter().rect_filled(bar, Rounding::same(1.5), ACCENT);
         ui.add_space(2.0);
         ui.label(RichText::new(title).font(display_font(T_SECTION)).color(TEXT));
-    });
+    })
+    .response
+    .rect;
     ui.add_space(SP_S);
     card_frame(236).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -2525,6 +2595,7 @@ fn section(ui: &mut egui::Ui, title: &str, note: Option<(&str, Color32)>, body: 
         }
     });
     ui.add_space(SP_2XL);
+    head
 }
 
 /// The fixed-width label column of a settings row.
@@ -2709,14 +2780,15 @@ fn choice_row<T: PartialEq + Clone>(ui: &mut egui::Ui, title: &str, value: &mut 
     let mut changed = false;
     ui.horizontal(|ui| {
         row_label(ui, title, enabled);
-        ui.spacing_mut().item_spacing.x = SP_XS;
-        for (v, label) in options {
-            let on = *value == *v;
-            if segment(ui, label, on, enabled).clicked() && !on {
-                *value = v.clone();
-                changed = true;
+        choice_wrap(ui, |ui| {
+            for (v, label) in options {
+                let on = *value == *v;
+                if segment(ui, label, on, enabled).clicked() && !on {
+                    *value = v.clone();
+                    changed = true;
+                }
             }
-        }
+        });
     });
     changed
 }
@@ -2761,6 +2833,99 @@ fn slider_row(
     settled
 }
 
+/// A compact number field. Returns true when it commits (Enter, or focus moving away); `invalid` paints it in the
+/// error colour (the caller doesn't save invalid text).
+fn num_field(ui: &mut egui::Ui, buf: &mut String, hint: &str, width: f32, invalid: bool, focus: bool, enabled: bool) -> bool {
+    let r = ui
+        .scope(|ui| {
+            if invalid {
+                let v = ui.visuals_mut();
+                for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                    w.bg_stroke = Stroke::new(1.0_f32, BAD);
+                }
+                v.selection.stroke = Stroke::new(1.0_f32, BAD);
+            }
+            let edit = egui::TextEdit::singleline(buf)
+                .hint_text(RichText::new(hint).color(MUTED))
+                .font(FontId::monospace(T_MONO + 0.5))
+                .text_color(if invalid { BAD } else { TEXT })
+                .margin(Margin::symmetric(SP_S, 6.0))
+                .desired_width(width)
+                .char_limit(9);
+            ui.add_enabled(enabled, edit)
+        })
+        .inner;
+    if focus {
+        r.request_focus();
+    }
+    r.lost_focus()
+}
+
+impl CustomInputs {
+    /// Shows / hides the custom FPS field, filled with the current cap when that's already a custom one.
+    fn toggle_fps(&mut self, current: i64) {
+        self.fps_open = !self.fps_open;
+        if self.fps_open {
+            let custom = !FPS_PRESETS.iter().any(|(v, _)| *v == current);
+            self.fps = if custom { current.to_string() } else { String::new() };
+            self.focus = true;
+        }
+    }
+
+    fn toggle_res(&mut self, current: [i64; 2]) {
+        self.res_open = !self.res_open;
+        if self.res_open {
+            let custom = !RES_PRESETS.iter().any(|(v, _)| *v == current);
+            self.res = if custom { [current[0].to_string(), current[1].to_string()] } else { Default::default() };
+            self.focus = true;
+        }
+    }
+
+    /// The FPS field + its hint. Some(cap) when a valid value was committed.
+    fn fps_field(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<i64> {
+        let invalid = !self.fps.trim().is_empty() && parse_fps(&self.fps).is_none();
+        let mut out = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SP_S;
+            if num_field(ui, &mut self.fps, "180", 64.0, invalid, std::mem::take(&mut self.focus), enabled) {
+                out = parse_fps(&self.fps);
+            }
+            let (hint, color) = if invalid { ("20 to 1000 FPS, or 0 for unlimited", BAD) } else { ("FPS  ·  Enter applies", MUTED) };
+            ui.label(RichText::new(hint).size(T_SMALL).color(color));
+        });
+        out
+    }
+
+    /// Width x height fields + hint. Some([w, h]) when both are valid and one of them committed.
+    fn res_field(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<[i64; 2]> {
+        let bad = |s: &str, r: &std::ops::RangeInclusive<i64>| !s.trim().is_empty() && parse_dim(s, r).is_none();
+        let (bad_w, bad_h) = (bad(&self.res[0], &RES_W), bad(&self.res[1], &RES_H));
+        let mut commit = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SP_S;
+            commit |= num_field(ui, &mut self.res[0], "1920", 64.0, bad_w, std::mem::take(&mut self.focus), enabled);
+            ui.label(RichText::new("x").size(T_SMALL).color(MUTED));
+            commit |= num_field(ui, &mut self.res[1], "1080", 64.0, bad_h, false, enabled);
+            let (hint, color) =
+                if bad_w || bad_h { ("Width 320 to 7680, height 240 to 4320", BAD) } else { ("Enter applies", MUTED) };
+            ui.label(RichText::new(hint).size(T_SMALL).color(color));
+        });
+        if !commit {
+            return None;
+        }
+        Some([parse_dim(&self.res[0], &RES_W)?, parse_dim(&self.res[1], &RES_H)?])
+    }
+}
+
+/// The wrapping area right of a settings label (segmented choices wrap under themselves, not under the label).
+fn choice_wrap<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(SP_XS, SP_XS);
+        add(ui)
+    })
+    .inner
+}
+
 /// A coloured dot and a sentence: the state lines in Settings.
 fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
@@ -2802,7 +2967,8 @@ impl LauncherApp {
                 });
 
                 let gfx_note = "Lighting and effects always render like Apex: presets only trade detail and resolution. Texture quality applies on the next launch, the rest live in game too (Esc > Video).";
-                section(ui, "GRAPHICS", Some((gfx_note, MUTED)), |ui| {
+                let scroll_gfx = self.screenshot.is_some() && self.frames < 60 && std::env::args().any(|a| a == "--scroll=graphics");
+                let gfx_head = section(ui, "GRAPHICS", Some((gfx_note, MUTED)), |ui| {
                     let g = &mut self.settings.graphics;
                     let mut save = false;
                     let mut preset = g.preset.clone();
@@ -2837,7 +3003,63 @@ impl LauncherApp {
                         g.render_scale = scale.round() as i64;
                         save = true;
                     }
-                    save |= choice_row(ui, "FPS cap", &mut g.fps_cap, &[(0, "NONE"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")], editable);
+                    // Resolution (stretched) and FPS cap: presets plus a Custom segment that reveals a number field
+                    let custom = &mut self.custom;
+                    ui.horizontal(|ui| {
+                        row_label(ui, "Resolution", editable);
+                        choice_wrap(ui, |ui| {
+                            for (v, label) in RES_PRESETS {
+                                if segment(ui, label, g.stretch == v, editable).clicked() && g.stretch != v {
+                                    g.stretch = v;
+                                    custom.res_open = false;
+                                    save = true;
+                                }
+                            }
+                            let on = !RES_PRESETS.iter().any(|(v, _)| *v == g.stretch);
+                            let label = if on { format!("Custom {} x {}", g.stretch[0], g.stretch[1]) } else { "Custom".to_owned() };
+                            if segment(ui, &label, on, editable).clicked() {
+                                custom.toggle_res(g.stretch);
+                            }
+                        });
+                    });
+                    if custom.res_open {
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_W + SP_S);
+                            if let Some(v) = custom.res_field(ui, editable) {
+                                g.stretch = v;
+                                custom.res_open = false;
+                                save = true;
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        row_label(ui, "FPS cap", editable);
+                        choice_wrap(ui, |ui| {
+                            for (v, label) in FPS_PRESETS {
+                                let label = if v == 0 { "None" } else { label };
+                                if segment(ui, label, g.fps_cap == v, editable).clicked() && g.fps_cap != v {
+                                    g.fps_cap = v;
+                                    custom.fps_open = false;
+                                    save = true;
+                                }
+                            }
+                            let on = !FPS_PRESETS.iter().any(|(v, _)| *v == g.fps_cap);
+                            let label = if on { format!("Custom {}", g.fps_cap) } else { "Custom".to_owned() };
+                            if segment(ui, &label, on, editable).clicked() {
+                                custom.toggle_fps(g.fps_cap);
+                            }
+                        });
+                    });
+                    if custom.fps_open {
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_W + SP_S);
+                            if let Some(v) = custom.fps_field(ui, editable) {
+                                g.fps_cap = v;
+                                custom.fps_open = false;
+                                save = true;
+                            }
+                        });
+                    }
                     ui.add_space(SP_XS);
                     save |= toggle_row(ui, &mut g.vsync, "V-Sync", "Waits for the display: no tearing, a frame of extra input lag.", editable);
                     if knobs {
@@ -2848,6 +3070,10 @@ impl LauncherApp {
                         err = Some(e);
                     }
                 });
+
+                if scroll_gfx {
+                    ui.scroll_to_rect(gfx_head, Some(Align::Min));
+                }
 
                 section(ui, "LAUNCH OPTIONS", None, |ui| {
                     let edit = egui::TextEdit::singleline(&mut self.launch_args)
@@ -3182,4 +3408,23 @@ fn apply_theme(ctx: &egui::Context) {
     style.spacing.slider_rail_height = 4.0;
     style.spacing.interact_size.y = 22.0;
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_fps_and_resolution_are_validated() {
+        assert_eq!(parse_fps("180"), Some(180));
+        assert_eq!(parse_fps(" 180 fps "), Some(180));
+        assert_eq!(parse_fps("0"), Some(0));
+        assert_eq!(parse_fps("Unlimited"), Some(0));
+        assert_eq!(parse_fps("12"), None);
+        assert_eq!(parse_fps("1001"), None);
+        assert_eq!(parse_fps("abc"), None);
+        assert_eq!(parse_dim("1366", &RES_W), Some(1366));
+        assert_eq!(parse_dim("200", &RES_H), None);
+        assert_eq!(parse_dim("8000", &RES_W), None);
+    }
 }
