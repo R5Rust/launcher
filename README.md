@@ -18,7 +18,7 @@ cd C:\Code\apps\r5rust-launcher
 cargo run --release
 ```
 
-Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--autoplay` presses Play once it's possible (for scripted
+Flags: `--page=notes|console|settings` opens on that page; `--maximized` starts maximized; `--install` opens the install card; `--install-demo` runs the installer's made-up progress (touches nothing); `--screenshot=<png>` opens without focus, saves one frame once the install check and textures are in, and closes (it ignores all mouse/keyboard input, so a live desktop can't click anything); `--idle` (with `--screenshot`) draws the idle state even while a game runs; `--expand-notes` opens the two newest patch-note updates; `--open-chip=<NAME>` holds a quick chip's menu open; `--open-maps` opens the maps panel; `--autoplay` presses Play once it's possible (for scripted
 tests). Press **Enter** on any page to play.
 
 Checking the UI: `--screenshot=<png> --idle` plus `--page=...` / `--install-demo` / `--expand-notes`, one run per page.
@@ -63,6 +63,15 @@ red accent**. The design tokens sit at the top of `src\main.rs` and every page u
   **No decorative shapes** (no diagonal streaks or red background art: Kainz, they read as AI slop).
 - The rail logo is still the game's banner (`assets\icon.png`), drawn exactly as in v0.2 (Kainz's call). The window,
   taskbar and exe use `assets\app-icon.png` / `app-icon.ico` (the game's white gear+A on a dark square).
+
+**Maps** (top right of the map card, like R5Flowstate's "All N maps"): a pill opens the selected mode's maps as tiles.
+The list is data (`MODES` at the top of `src\main.rs`: mode -> maps with bsp, name, note, playable). Firing Range has
+two: `mp_rr_canyonlands_staging_mu1` (the current range, selected) and `mp_rr_canyonlands_staging` (the original range,
+dimmed and locked as "Coming later" until it's ported). Tile art is each map's loading screen from the player's files
+(`<assets>\images\ui\maps_<bsp>_loadscreen\*.png`, loaded small and off the UI thread when the panel opens); a missing
+picture gives a plain tile. The original range's picture was put there by hand
+(`D:\R5Rust\assets-retail\images\ui\maps_mp_rr_canyonlands_staging_loadscreen\firing_range_s0.png`); it isn't in this
+repo. Picking a different playable map isn't wired up yet (there's only one).
 
 Under the map card on Play, **quick chips**: Resolution (stretched res presets + custom), Display (fullscreen /
 windowed, `r5rust.toml`), FPS limit (unlimited, 60..360 + custom), Launch (fly mode, show FPS, developer console, open

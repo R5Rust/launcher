@@ -186,6 +186,36 @@ fn color_image(image: image::DynamicImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba)
 }
 
+/// One map in a mode's list. `playable: false` is shown (art, name) but can't be picked yet.
+struct MapDef {
+    /// The map's bsp name: its loading screen is read from `<assets>\images\ui\maps_<bsp>_loadscreen\`.
+    bsp: &'static str,
+    name: &'static str,
+    note: &'static str,
+    playable: bool,
+}
+
+/// A game mode and its maps. More modes / maps: add entries here, the Play page and maps panel follow.
+struct ModeDef {
+    name: &'static str,
+    kicker: &'static str,
+    maps: &'static [MapDef],
+}
+
+const MODES: &[ModeDef] = &[ModeDef {
+    name: "Firing Range",
+    kicker: "Training mode",
+    maps: &[
+        MapDef { bsp: "mp_rr_canyonlands_staging_mu1", name: "Firing Range", note: "The current range", playable: true },
+        MapDef {
+            bsp: "mp_rr_canyonlands_staging",
+            name: "Firing Range (original)",
+            note: "The launch-era range. Not ported yet",
+            playable: false,
+        },
+    ],
+}];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Play,
@@ -236,6 +266,15 @@ struct LauncherApp {
     page: Page,
     notice: Option<(String, Tone)>,
     mode_menu_open: bool,
+    /// Index into MODES.
+    mode: usize,
+    /// The maps panel (top right of the map card).
+    maps_open: bool,
+    /// Loading screens of the current mode's other maps (None: not extracted), loaded off the UI thread on demand.
+    thumbs: std::collections::HashMap<String, Option<(egui::TextureHandle, Vec2)>>,
+    thumbs_pending: HashSet<String>,
+    thumbs_tx: mpsc::Sender<(String, Option<egui::ColorImage>)>,
+    thumbs_rx: Receiver<(String, Option<egui::ColorImage>)>,
     launch_args: String,
     play_job: Option<Job>,
     stop_requested: bool,
@@ -315,7 +354,15 @@ impl LauncherApp {
                 repaint.request_repaint();
             }
         });
+        let (thumbs_tx, thumbs_rx) = mpsc::channel();
         Self {
+            mode: 0,
+            // `--open-maps`: open the maps panel on start (screenshots)
+            maps_open: std::env::args().any(|a| a == "--open-maps"),
+            thumbs: Default::default(),
+            thumbs_pending: HashSet::new(),
+            thumbs_tx,
+            thumbs_rx,
             poller: Poller::start(game_root.clone(), ctx.clone()),
             settings: GameSettings::load(&game_root),
             game_root,
@@ -567,6 +614,35 @@ impl LauncherApp {
         }
     }
 
+    /// While the maps panel is open: loads the other maps' loading screens (small, off the UI thread, once each).
+    fn sync_thumbs(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        while let Ok((bsp, img)) = self.thumbs_rx.try_recv() {
+            self.thumbs_pending.remove(&bsp);
+            let tex = img.map(|img| {
+                let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
+                (ctx.load_texture(format!("map-thumb-{bsp}"), img, egui::TextureOptions::LINEAR), size)
+            });
+            self.thumbs.insert(bsp, tex);
+        }
+        if !self.maps_open {
+            return;
+        }
+        for map in MODES[self.mode].maps {
+            if map.bsp == snap.files.map || self.thumbs.contains_key(map.bsp) || self.thumbs_pending.contains(map.bsp) {
+                continue;
+            }
+            self.thumbs_pending.insert(map.bsp.to_owned());
+            let (tx, ctx, bsp, assets) = (self.thumbs_tx.clone(), ctx.clone(), map.bsp.to_owned(), snap.files.assets_root.clone());
+            thread::spawn(move || {
+                let img = game::loadscreen_for(&assets, &bsp)
+                    .and_then(|p| image::open(p).ok())
+                    .map(|i| color_image(i.resize(640, 360, image::imageops::FilterType::Triangle)));
+                let _ = tx.send((bsp, img));
+                ctx.request_repaint();
+            });
+        }
+    }
+
     /// Loads the map's loading screen off the UI thread whenever the file it points at changes.
     fn sync_art(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         if let Some(rx) = &self.backdrop_rx
@@ -631,7 +707,10 @@ impl eframe::App for LauncherApp {
         if let Some(path) = self.screenshot.clone() {
             self.frames += 1;
             // once the first install check and the backdrop are in (or after ~10 s)
-            let ready = self.install_status != InstallStatus::Checking && self.backdrop_rx.is_none() && self.art_rx.is_none();
+            let ready = self.install_status != InstallStatus::Checking
+                && self.backdrop_rx.is_none()
+                && self.art_rx.is_none()
+                && self.thumbs_pending.is_empty();
             if self.frames > 20 && (ready || self.frames == 330) && self.frames < 1000 {
                 self.frames = 1000;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
@@ -654,6 +733,7 @@ impl eframe::App for LauncherApp {
         }
         let snap = self.poller.get();
         self.sync_art(ctx, &snap);
+        self.sync_thumbs(ctx, &snap);
         if self.install_status == InstallStatus::Checking && self.install_rx.is_none() {
             self.check_install(ctx, snap.files.assets_root.clone());
         }
@@ -761,6 +841,8 @@ enum Icon {
     Copy,
     Check,
     Refresh,
+    Grid,
+    Lock,
 }
 
 fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
@@ -831,6 +913,22 @@ fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32)
         }
         Icon::Check => {
             line(vec![v(-5.5, 0.5), v(-1.5, 4.5), v(5.5, -4.0)]);
+        }
+        Icon::Grid => {
+            for (x, y) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
+                p.rect_stroke(Rect::from_center_size(v(x, y), Vec2::splat(5.0 * k)), Rounding::same(1.0 * k), s);
+            }
+        }
+        Icon::Lock => {
+            p.rect_stroke(Rect::from_min_max(v(-5.5, -1.0), v(5.5, 7.0)), Rounding::same(1.5 * k), s);
+            let mut pts = vec![v(-3.2, -1.0)];
+            pts.extend((0..=12).map(|i| {
+                let a = std::f32::consts::PI * (1.0 + i as f32 / 12.0);
+                v(a.cos() * 3.2, -4.0 + a.sin() * 3.2)
+            }));
+            pts.push(v(3.2, -1.0));
+            line(pts);
+            p.circle_filled(v(0.0, 3.0), 1.0 * k, color);
         }
         Icon::Refresh => {
             let pts: Vec<Pos2> = (0..=20)
@@ -1171,9 +1269,14 @@ fn plural(n: u32) -> &'static str {
 impl LauncherApp {
     /// The map art (or a plain placeholder: the launcher ships no game imagery) filling `rect`.
     fn paint_art(&self, ui: &egui::Ui, rect: Rect, rounding: f32) {
-        match &self.art {
+        self.paint_cover(ui, self.art.as_ref(), rect, rounding, Color32::WHITE);
+    }
+
+    /// `art` covering `rect` (cropped to fill), tinted; the placeholder when there's none.
+    fn paint_cover(&self, ui: &egui::Ui, art: Option<&(egui::TextureHandle, Vec2)>, rect: Rect, rounding: f32, tint: Color32) {
+        match art {
             Some((tex, size)) => {
-                egui::Image::new((tex.id(), *size)).uv(cover_uv(*size, rect.size())).rounding(rounding).paint_at(ui, rect);
+                egui::Image::new((tex.id(), *size)).uv(cover_uv(*size, rect.size())).rounding(rounding).tint(tint).paint_at(ui, rect);
             }
             None => {
                 let p = ui.painter();
@@ -1229,6 +1332,7 @@ impl LauncherApp {
         let toggled = tab_response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
         if toggled {
             self.mode_menu_open = !self.mode_menu_open;
+            self.maps_open = false;
         }
 
         // The install card (below) covers the art; the title block stays out of its way then.
@@ -1251,8 +1355,9 @@ impl LauncherApp {
                 FontId::proportional(15.5),
                 SECONDARY,
             );
-            let title = painter.text(Pos2::new(x - 3.0, tagline.top() + 8.0), Align2::LEFT_BOTTOM, "FIRING RANGE", display_font(T_HERO), TEXT);
-            paint_caption(&painter, Pos2::new(x, title.top() + 12.0), Align2::LEFT_BOTTOM, "Training mode", ACCENT_HI);
+            let mode = &MODES[self.mode];
+            let title = painter.text(Pos2::new(x - 3.0, tagline.top() + 8.0), Align2::LEFT_BOTTOM, mode.name.to_uppercase(), display_font(T_HERO), TEXT);
+            paint_caption(&painter, Pos2::new(x, title.top() + 12.0), Align2::LEFT_BOTTOM, mode.kicker, ACCENT_HI);
             if phase != PlayPhase::Idle {
                 let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) as f32 * 3.0).sin().abs();
                 let dot = Pos2::new(meta.right() + 24.0, meta.center().y);
@@ -1285,6 +1390,47 @@ impl LauncherApp {
                 });
                 ctx.data_mut(|d| d.insert_temp(h_id, r.response.rect.height()));
             });
+        }
+
+        // Maps: a pill in the top-right corner of the art (like R5Flowstate's "All N maps"), opening the mode's map list
+        let maps = MODES[self.mode].maps;
+        let mut pill_clicked = false;
+        if !show {
+            let text = format!("All {} maps", maps.len());
+            let galley = painter.layout_no_wrap(text, FontId::proportional(T_BODY - 0.5), TEXT);
+            let pill_rect = Rect::from_min_size(
+                Pos2::new(hero.right() - SP_XL - (galley.size().x + 48.0), hero.top() + SP_XL + 2.0),
+                Vec2::new(galley.size().x + 48.0, 34.0),
+            );
+            let r = ui.interact(pill_rect, egui::Id::new("maps-pill"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let hover = ctx.animate_bool_with_time(r.id, r.hovered() || self.maps_open, 0.12);
+            painter.rect(
+                pill_rect,
+                Rounding::same(17.0),
+                Color32::from_rgba_unmultiplied(10, 11, 13, (170.0 + hover * 60.0) as u8),
+                Stroke::new(1.0_f32, glass(Color32::WHITE, (28.0 + hover * 40.0) as u8)),
+            );
+            paint_icon(&painter, Icon::Grid, Pos2::new(pill_rect.left() + 22.0, pill_rect.center().y), 14.0, TEXT);
+            painter.galley(Pos2::new(pill_rect.left() + 36.0, pill_rect.center().y - galley.size().y / 2.0), galley, TEXT);
+            pill_clicked = r.clicked();
+            if pill_clicked {
+                self.maps_open = !self.maps_open;
+                self.mode_menu_open = false;
+            }
+            if self.maps_open {
+                let w = 2.0 * 272.0 + SP_L + 2.0 * (SP_L + 2.0);
+                let pos = Pos2::new(hero.right() - SP_XL - w, pill_rect.bottom() + SP_S + 2.0);
+                let area = egui::Area::new(egui::Id::new("maps-panel"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos)
+                    .show(ctx, |ui| self.maps_panel(ui, snap, w));
+                let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+                if area.inner || esc || (!pill_clicked && area.response.clicked_elsewhere()) {
+                    self.maps_open = false;
+                }
+            }
+        } else {
+            self.maps_open = false;
         }
 
         if self.mode_menu_open {
@@ -1626,6 +1772,77 @@ impl LauncherApp {
         }
     }
 
+    /// The selected mode's maps as tiles: the one being played is selected, maps that aren't ported yet are dimmed and
+    /// locked. Returns true when the panel should close.
+    fn maps_panel(&self, ui: &mut egui::Ui, snap: &Snapshot, width: f32) -> bool {
+        let mode = &MODES[self.mode];
+        let mut close = false;
+        card_frame(250).inner_margin(Margin::same(SP_L + 2.0)).show(ui, |ui| {
+            ui.set_width(width - 2.0 * (SP_L + 2.0));
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(caption(&format!("{} maps", mode.name)).color(SECONDARY));
+                    let ready = mode.maps.iter().filter(|m| m.playable).count();
+                    ui.label(RichText::new(format!("{} maps, {ready} playable", mode.maps.len())).size(T_SMALL).color(MUTED));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+                    if r.hovered() {
+                        ui.painter().rect_filled(rect, Rounding::same(R_CTRL), HOVER);
+                    }
+                    paint_icon(ui.painter(), Icon::Close, rect.center(), 12.0, if r.hovered() { TEXT } else { SECONDARY });
+                    close |= r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                });
+            });
+            ui.add_space(SP_M);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(SP_L, SP_L);
+                for map in mode.maps {
+                    close |= self.map_tile(ui, map, map.bsp == snap.files.map);
+                }
+            });
+        });
+        close
+    }
+
+    /// One map: 16:9 art, name, bsp, state. Returns true when a playable map was clicked.
+    fn map_tile(&self, ui: &mut egui::Ui, map: &MapDef, selected: bool) -> bool {
+        let w = 272.0;
+        let art_h = (w * 9.0 / 16.0_f32).round();
+        let sense = if map.playable { Sense::click() } else { Sense::hover() };
+        let (rect, r) = ui.allocate_exact_size(Vec2::new(w, art_h + 58.0), sense);
+        let hover = ui.ctx().animate_bool_with_time(r.id, map.playable && r.hovered(), 0.12);
+        let art_rect = Rect::from_min_size(rect.min, Vec2::new(w, art_h));
+        let art = if selected { self.art.as_ref() } else { self.thumbs.get(map.bsp).and_then(Option::as_ref) };
+        let tint = if map.playable { Color32::WHITE } else { Color32::from_gray(96) };
+        self.paint_cover(ui, art, art_rect, R_CTRL, tint);
+        let p = ui.painter();
+        let border = if selected {
+            Stroke::new(2.0_f32, ACCENT)
+        } else {
+            Stroke::new(1.0_f32, glass(Color32::WHITE, (22.0 + hover * 60.0) as u8))
+        };
+        p.rect_stroke(art_rect, Rounding::same(R_CTRL), border);
+        if !map.playable {
+            let c = art_rect.center();
+            p.circle(c, 20.0, Color32::from_rgba_unmultiplied(10, 11, 13, 210), Stroke::new(1.0_f32, glass(Color32::WHITE, 40)));
+            paint_icon(p, Icon::Lock, c, 16.0, SECONDARY);
+        }
+        let name_y = art_rect.bottom() + SP_M;
+        p.text(Pos2::new(rect.left(), name_y), Align2::LEFT_TOP, map.name, FontId::proportional(T_BODY + 0.5), if map.playable { TEXT } else { SECONDARY });
+        p.text(Pos2::new(rect.left(), name_y + 22.0), Align2::LEFT_TOP, map.bsp, FontId::monospace(11.0), MUTED);
+        let pill_pos = Pos2::new(rect.right(), name_y + 9.0);
+        if selected {
+            pill(p, pill_pos, Align2::RIGHT_CENTER, "Selected", PillStyle::Accent);
+        } else if !map.playable {
+            pill(p, pill_pos, Align2::RIGHT_CENTER, "Coming later", PillStyle::Outline(MUTED));
+        }
+        let r = if map.playable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
+        let r = r.on_hover_text(map.note);
+        map.playable && r.clicked()
+    }
+
     /// Returns true when the menu should close (a mode was picked).
     fn mode_menu(&self, ui: &mut egui::Ui) -> bool {
         let mut picked = false;
@@ -1644,7 +1861,7 @@ impl LauncherApp {
             let thumb = Rect::from_min_size(row.left_top() + Vec2::new(SP_M, 10.0), Vec2::new(98.0, 56.0));
             self.paint_art(ui, thumb, R_CTRL);
             let text_x = thumb.right() + SP_M;
-            p.text(Pos2::new(text_x, row.top() + 20.0), Align2::LEFT_TOP, "Firing Range", FontId::proportional(T_BODY + 1.0), TEXT);
+            p.text(Pos2::new(text_x, row.top() + 20.0), Align2::LEFT_TOP, MODES[self.mode].name, FontId::proportional(T_BODY + 1.0), TEXT);
             paint_caption(p, Pos2::new(text_x, row.top() + 44.0), Align2::LEFT_TOP, "Selected", ACCENT_HI);
             paint_icon(p, Icon::Check, Pos2::new(row.right() - 20.0, row.center().y), 14.0, ACCENT_HI);
             picked = response.clicked();

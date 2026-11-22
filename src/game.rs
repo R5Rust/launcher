@@ -178,6 +178,11 @@ fn map_bsp(root: &Path) -> String {
         .unwrap_or_else(|| "mp_rr_canyonlands_staging_mu1".to_owned())
 }
 
+/// A map's loading-screen picture in the player's files: `<assets>\images\ui\maps_<bsp>_loadscreen\<first>.png`.
+pub fn loadscreen_for(assets_root: &Path, bsp: &str) -> Option<PathBuf> {
+    first_png(&assets_root.join("images").join("ui").join(format!("maps_{bsp}_loadscreen")))
+}
+
 fn first_png(dir: &Path) -> Option<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
