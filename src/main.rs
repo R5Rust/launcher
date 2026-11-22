@@ -417,6 +417,8 @@ struct LauncherApp {
     /// A download running in the background (a game build, or a launcher update).
     update_task: Option<(UpdateKind, update::Task)>,
     autodownloaded: bool,
+    /// frames spent waiting on a scripted --download / --update-launcher in --screenshot mode
+    test_wait: u32,
     /// Discord Rich Presence while the game runs (Settings > Launcher; discord_rpc.txt, on unless "0").
     presence: presence::Presence,
     rpc_on: bool,
@@ -519,6 +521,7 @@ impl LauncherApp {
             feed: Arc::new(Mutex::new(update::Feed::default())),
             update_task: None,
             autodownloaded: false,
+            test_wait: 0,
             presence: presence::Presence::start(),
             rpc_on: game::read_setting("discord_rpc.txt").is_none_or(|v| v != "0"),
         };
@@ -933,10 +936,28 @@ impl eframe::App for LauncherApp {
         if let Some(path) = self.screenshot.clone() {
             self.frames += 1;
             // once the first install check and the backdrop are in (or after ~10 s)
+            // a scripted `--download` / `--update-launcher`: wait until it has started and finished (up to ~30 min)
+            let want_dl = std::env::args().any(|a| a == "--download");
+            let want_up = std::env::args().any(|a| a == "--update-launcher");
+            let waiting = (want_dl || want_up) && self.test_wait < 60_000 && {
+                let snap0 = self.poller.get();
+                let (checked, launcher_new) = {
+                    let f = self.feed.lock().unwrap();
+                    (f.checked, f.launcher_update().is_some())
+                };
+                let trigger_pending = !self.autodownloaded
+                    && (!checked || (want_dl && self.available_build(&snap0).is_some()) || (want_up && launcher_new));
+                self.update_task.is_some() || trigger_pending
+            };
+            if waiting {
+                self.frames = self.frames.min(20);
+                self.test_wait += 1;
+            }
             let ready = self.install_status != InstallStatus::Checking
                 && self.backdrop_rx.is_none()
                 && self.art_rx.is_none()
-                && self.thumbs_pending.is_empty();
+                && self.thumbs_pending.is_empty()
+                && !waiting;
             if self.frames > 20 && (ready || self.frames == 330) && self.frames < 1000 {
                 self.frames = 1000;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
