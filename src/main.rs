@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod game;
+mod update;
 
 use std::{
     collections::HashSet,
@@ -80,6 +81,15 @@ const PAGE_MARGIN: Margin = Margin { left: GUTTER, right: GUTTER, top: PAGE_TOP,
 const LABEL_W: f32 = 180.0;
 
 fn main() -> eframe::Result<()> {
+    // Apps & features > Uninstall
+    if std::env::args().any(|a| a == "--uninstall") {
+        update::uninstall();
+        return Ok(());
+    }
+    // first run of a downloaded exe: install to %LOCALAPPDATA%\Programs\R5Rust Launcher, add shortcuts, start that copy
+    if update::self_install() {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("R5Rust Launcher")
@@ -401,6 +411,17 @@ struct LauncherApp {
     /// `--screenshot=<png>`: save one frame there, then close.
     screenshot: Option<PathBuf>,
     frames: u32,
+    /// Player mode: what GitHub Releases has (game builds, install tools, launcher versions).
+    feed: Arc<Mutex<update::Feed>>,
+    /// A download running in the background (a game build, or a launcher update).
+    update_task: Option<(UpdateKind, update::Task)>,
+    autodownloaded: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateKind {
+    Game,
+    Launcher,
 }
 
 impl LauncherApp {
@@ -491,7 +512,14 @@ impl LauncherApp {
             start_maximized: std::env::args().any(|a| a == "--maximized"),
             screenshot: std::env::args().find_map(|a| a.strip_prefix("--screenshot=").map(PathBuf::from)),
             frames: 0,
+            feed: Arc::new(Mutex::new(update::Feed::default())),
+            update_task: None,
+            autodownloaded: false,
         };
+        // what's on GitHub (screenshots stay offline unless asked: `--check-updates`)
+        if app.screenshot.is_none() || std::env::args().any(|a| a == "--check-updates") {
+            update::check(ctx.clone(), app.feed.clone());
+        }
         if app.screenshot.is_some() {
             // `--demo-maps=N`: N made-up maps (cycling the real ones' art) to show the looping carousel
             if let Some(n) = std::env::args().find_map(|a| a.strip_prefix("--demo-maps=").and_then(|v| v.parse::<usize>().ok())) {
@@ -617,6 +645,68 @@ impl LauncherApp {
 
     fn building(&self) -> bool {
         self.build_job.as_ref().is_some_and(Job::running)
+    }
+
+    fn updating(&self, kind: UpdateKind) -> bool {
+        self.update_task.as_ref().is_some_and(|(k, _)| *k == kind)
+    }
+
+    /// Player mode: the newest published build when it's newer than the one on disk (or none is there yet).
+    fn available_build(&self, snap: &Snapshot) -> Option<update::Release> {
+        let feed = self.feed.lock().unwrap();
+        let latest = feed.newest_build()?;
+        let have = snap.newest().map(|b| b.hash.as_str()).unwrap_or("");
+        (have.is_empty() || !same_hash(have, latest.build_hash())).then(|| latest.clone())
+    }
+
+    /// Downloads the newest build (and the install tools it needs) into the game folder, off the UI thread.
+    fn update_game(&mut self, ctx: &egui::Context) {
+        let (release, all) = {
+            let feed = self.feed.lock().unwrap();
+            (feed.newest_build().cloned(), feed.game.clone())
+        };
+        let Some(release) = release else {
+            self.notice = Some(("No game build is published yet.".into(), Tone::Bad));
+            return;
+        };
+        let root = self.game_root.clone();
+        let task = update::Task::spawn(ctx.clone(), move |p| update::install_build(&root, &release, &all, p));
+        self.update_task = Some((UpdateKind::Game, task));
+        self.notice = None;
+    }
+
+    /// Downloads the newer launcher, swaps it in, and restarts into it.
+    fn update_launcher(&mut self, ctx: &egui::Context) {
+        let Some(release) = self.feed.lock().unwrap().launcher_update().cloned() else { return };
+        let task = update::Task::spawn(ctx.clone(), move |p| update::self_update(&release, p).map(|exe| exe.display().to_string()));
+        self.update_task = Some((UpdateKind::Launcher, task));
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let Some((kind, task)) = &self.update_task else { return };
+        let Some(result) = task.take_result() else {
+            ctx.request_repaint_after(Duration::from_millis(200));
+            return;
+        };
+        let kind = *kind;
+        self.update_task = None;
+        match (kind, result) {
+            (UpdateKind::Game, Ok(summary)) => {
+                self.notice = Some((summary, Tone::Good));
+                self.settings = GameSettings::load(&self.game_root);
+                self.poller.refresh();
+                self.check_install(ctx, self.poller.get().files.assets_root.clone());
+            }
+            (UpdateKind::Launcher, Ok(exe)) => {
+                if std::process::Command::new(&exe).spawn().is_ok() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.notice = Some(("Launcher updated: restart it to use the new version.".into(), Tone::Good));
+                }
+            }
+            (UpdateKind::Game, Err(e)) => self.notice = Some((format!("Download failed: {e}"), Tone::Bad)),
+            (UpdateKind::Launcher, Err(e)) => self.notice = Some((format!("Launcher update failed: {e}"), Tone::Bad)),
+        }
     }
 
     fn installing(&self) -> bool {
@@ -871,9 +961,15 @@ impl eframe::App for LauncherApp {
         self.paint_backdrop(ctx);
         let phase = self.phase(&snap);
         let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
-        let can_build = matches!(snap.state, GameState::Ready | GameState::NoBuild)
-            && !self.building()
-            && self.game_root.join("tools/publish.ps1").is_file();
+        self.poll_update(ctx);
+        let can_build = if snap.dev {
+            matches!(snap.state, GameState::Ready | GameState::NoBuild)
+                && !self.building()
+                && self.game_root.join("tools/publish.ps1").is_file()
+        } else {
+            // player: download when there's something newer and nothing else is busy
+            self.update_task.is_none() && !self.installing() && phase == PlayPhase::Idle && self.available_build(&snap).is_some()
+        };
 
         let mut action = FooterAction::default();
         let mut browse_clicked = false;
@@ -911,6 +1007,11 @@ impl eframe::App for LauncherApp {
         if can_play && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Enter)) {
             action.play = true;
         }
+        // `--download`: press Download/Update once it's possible (scripted tests of player mode)
+        if can_build && !snap.dev && self.update_task.is_none() && std::env::args().any(|a| a == "--download") && !self.autodownloaded {
+            self.autodownloaded = true;
+            action.build = true;
+        }
         if self.autoplay && can_play {
             self.autoplay = false;
             action.play = true;
@@ -919,7 +1020,7 @@ impl eframe::App for LauncherApp {
             self.browse();
         }
         if action.build {
-            self.build(ctx);
+            if snap.dev { self.build(ctx) } else { self.update_game(ctx) }
         }
         if action.stop {
             self.stop();
@@ -1141,10 +1242,27 @@ impl LauncherApp {
                 p.hline(full.x_range(), band_top + 0.5, Stroke::new(1.0_f32, BORDER));
                 let build = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("none");
                 let launcher = format!("v{}", env!("CARGO_PKG_VERSION"));
+                // a newer launcher on GitHub: the version turns into a button (installed copies only, not cargo runs)
+                let newer = (!update::is_dev_exe()).then(|| self.feed.lock().unwrap().launcher_update().map(|r| r.tag.clone())).flatten();
                 for (i, (key, value)) in [("Game", build), ("Launcher", launcher.as_str())].into_iter().enumerate() {
                     let y = band_top + FOOTER_H / 2.0 + (i as f32 - 0.5) * 24.0;
                     paint_caption(&p, Pos2::new(full.left() + SP_XL, y), Align2::LEFT_CENTER, key, MUTED);
-                    p.text(Pos2::new(full.right() - SP_XL, y), Align2::RIGHT_CENTER, value, FontId::monospace(T_MONO), SECONDARY);
+                    match (&newer, i) {
+                        (Some(tag), 1) => {
+                            let text = if self.updating(UpdateKind::Launcher) { "UPDATING...".to_owned() } else { format!("UPDATE {tag}") };
+                            let galley = p.layout_no_wrap(text, FontId::proportional(T_SMALL), ACCENT_HI);
+                            let r = Rect::from_min_size(Pos2::new(full.right() - SP_XL - galley.size().x - 16.0, y - 11.0), Vec2::new(galley.size().x + 16.0, 22.0));
+                            let resp = ui.interact(r, egui::Id::new("launcher-update"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            p.rect(r, Rounding::same(R_CTRL), if resp.hovered() { ACCENT_TINT } else { Color32::TRANSPARENT }, Stroke::new(1.0_f32, ACCENT));
+                            p.galley(r.center() - galley.size() / 2.0, galley, ACCENT_HI);
+                            if resp.clicked() && self.update_task.is_none() {
+                                self.update_launcher(ui.ctx());
+                            }
+                        }
+                        _ => {
+                            p.text(Pos2::new(full.right() - SP_XL, y), Align2::RIGHT_CENTER, value, FontId::monospace(T_MONO), SECONDARY);
+                        }
+                    }
                 }
             });
     }
@@ -1241,7 +1359,9 @@ impl LauncherApp {
             ui.allocate_ui_with_layout(Vec2::new(left_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(left_w);
                 ui.spacing_mut().item_spacing.y = 3.0;
+                let not_downloaded = !snap.dev && !matches!(snap.state, GameState::Ready);
                 let title = match snap.state {
+                    _ if not_downloaded => "Not downloaded yet",
                     GameState::Ready if snap.current.is_some() => "Installed build",
                     GameState::Ready => "Staged build",
                     GameState::NoBuild => "No build yet",
@@ -1253,6 +1373,7 @@ impl LauncherApp {
                     ui.add(egui::Label::new(RichText::new(text).size(T_BODY + 0.5).color(TEXT)).truncate());
                 };
                 match (snap.state, snap.current.as_ref().or(snap.next.as_ref())) {
+                    _ if not_downloaded => body(ui, "Press Download to get the latest build."),
                     (GameState::Ready, Some(build)) => {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&build.hash).monospace().size(T_BODY).color(ACCENT_HI));
@@ -1315,12 +1436,26 @@ impl LauncherApp {
                 Some((i, s)) => (format!("Installing game files: {} ({}/{}).", s.title, i + 1, view.steps.len()), SECONDARY),
                 None => ("Installing game files...".to_owned(), SECONDARY),
             }
+        } else if let Some((_, task)) = &self.update_task {
+            let p = &task.progress;
+            let pct = p.fraction().map(|f| format!(" {:.0}%", f * 100.0)).unwrap_or_default();
+            (format!("{}...{pct}", p.stage()), SECONDARY)
+        } else if !snap.dev && !snap.is_ready() {
+            let feed = self.feed.lock().unwrap();
+            match (&feed.error, feed.checked, feed.newest_build()) {
+                (_, _, Some(b)) => (format!("Build {} ({}) is ready to download.", b.build_hash(), b.date), MUTED),
+                (Some(e), _, None) => (format!("Couldn't reach GitHub: {e}"), AMBER),
+                (None, true, None) => ("No game build is published yet.".to_owned(), AMBER),
+                (None, false, None) => ("Checking for builds...".to_owned(), MUTED),
+            }
         } else if snap.is_ready() && !snap.files.ok() {
             ("Game files missing: press Install on the Play page.".to_owned(), AMBER)
         } else if matches!(self.install_status, InstallStatus::Stale(_)) {
             ("Apex or the installer changed: update the game files in Settings > Game files.".to_owned(), AMBER)
         } else if let (Some(next), Some(_)) = (&snap.next, &snap.current) {
             (format!("Update {} staged. It installs when you press Play.", next.hash), GOOD)
+        } else if let Some(b) = self.available_build(snap).filter(|_| !snap.dev) {
+            (format!("Update {} ({}) is available: press Update.", b.build_hash(), b.date), ACCENT_HI)
         } else if let Some(n) = snap.unbuilt.filter(|n| *n > 0) {
             (format!("{n} newer commit{} not built yet.", plural(n)), MUTED)
         } else if let Some(b) = snap.newest() {
@@ -1335,10 +1470,31 @@ impl LauncherApp {
         let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
         let hover = ui.ctx().animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
         let p = ui.painter();
-        let pending = snap.unbuilt.is_some_and(|n| n > 0) || snap.state == GameState::NoBuild;
+        let pending = if snap.dev { snap.unbuilt.is_some_and(|n| n > 0) || snap.state == GameState::NoBuild } else { enabled };
         let border = if pending && enabled { ACCENT } else { mix(BORDER, Color32::from_rgb(70, 76, 86), hover) };
         p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), mix(RAISED, HOVER, hover), Stroke::new(1.0_f32, border));
-        let (title, detail, detail_color) = if let Some(job) = self.build_job.as_ref().filter(|j| j.running()) {
+        let downloading = self.updating(UpdateKind::Game);
+        let (title, detail, detail_color) = if !snap.dev {
+            let first = !snap.is_ready();
+            let verb = if first { "DOWNLOAD" } else { "UPDATE" };
+            if let Some((_, task)) = self.update_task.as_ref().filter(|_| downloading) {
+                let p = &task.progress;
+                let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+                let detail = match p.fraction() {
+                    Some(_) if p.stage().starts_with("Unpacking") => "unpacking".to_owned(),
+                    Some(_) => format!("{:.0} / {:.0} MB", mb(p.done.load(std::sync::atomic::Ordering::Relaxed)), mb(p.total.load(std::sync::atomic::Ordering::Relaxed))),
+                    None => "starting".to_owned(),
+                };
+                ("DOWNLOADING", detail, SECONDARY)
+            } else {
+                match self.available_build(snap) {
+                    Some(b) => (verb, format!("build {} · {}", b.build_hash(), b.date), ACCENT_HI),
+                    None if !self.feed.lock().unwrap().checked => (verb, "checking...".to_owned(), MUTED),
+                    None if first => (verb, "nothing published yet".to_owned(), AMBER),
+                    None => ("UP TO DATE", "latest build".to_owned(), MUTED),
+                }
+            }
+        } else if let Some(job) = self.build_job.as_ref().filter(|j| j.running()) {
             ("BUILDING", format!("cargo build  {}", fmt_duration(job.elapsed())), SECONDARY)
         } else if snap.state == GameState::NoBuild {
             ("BUILD LATEST", "no build yet".to_owned(), AMBER)
@@ -1354,6 +1510,15 @@ impl LauncherApp {
         p.text(rect.left_top() + Vec2::new(SP_L, 34.0), Align2::LEFT_TOP, detail, FontId::proportional(11.5), detail_color);
         if self.building() {
             paint_progress_line(ui, rect, ACCENT_HI);
+        }
+        if let Some((_, task)) = self.update_task.as_ref().filter(|_| downloading) {
+            match task.progress.fraction() {
+                Some(f) => {
+                    let bar = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - 2.0), Pos2::new(rect.left() + rect.width() * f.clamp(0.0, 1.0), rect.bottom()));
+                    ui.painter().rect_filled(bar, Rounding::ZERO, ACCENT_HI);
+                }
+                None => paint_progress_line(ui, rect, ACCENT_HI),
+            }
         }
         enabled && response.clicked()
     }

@@ -26,11 +26,22 @@ pub const KEEP_LINES: usize = 5000;
 pub const HISTORY_LEN: usize = 100;
 
 /// A command with no console window: the launcher is a GUI app, so every child would otherwise flash one.
-fn quiet(program: &str) -> Command {
+fn quiet(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+/// PowerShell 7 for the game's scripts: the portable copy the install tools bring (`tools\bin\pwsh`), else `pwsh`.
+pub fn pwsh(root: &Path) -> PathBuf {
+    let bundled = root.join("tools").join("bin").join("pwsh").join("pwsh.exe");
+    if bundled.is_file() { bundled } else { PathBuf::from("pwsh") }
+}
+
+/// A dev checkout (git + tools\publish.ps1: builds come from cargo) rather than a player's downloaded game folder.
+pub fn is_dev_root(root: &Path) -> bool {
+    root.join(".git").exists() && root.join("tools").join("publish.ps1").is_file()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -104,6 +115,8 @@ pub struct Snapshot {
     pub running: bool,
     /// The extracted game files R5Rust loads (never shipped; made from the player's own Apex install).
     pub files: GameFiles,
+    /// A dev checkout (cargo builds, git history) rather than a downloaded game.
+    pub dev: bool,
 }
 
 /// The map the game loads and whether its extracted files are on disk.
@@ -138,7 +151,8 @@ impl GameFiles {
     }
 }
 
-/// Same order as the game's `Config::assets_root`: env R5RUST_ASSETS > r5rust.toml `assets_root` > D:\R5Rust\assets.
+/// Same order as the game's `Config::assets_root`: env R5RUST_ASSETS > r5rust.toml `assets_root` > D:\R5Rust\assets
+/// (a player's folder: `%LOCALAPPDATA%\R5Rust\assets`, where tools\install.ps1 puts them by default).
 fn assets_root(root: &Path) -> PathBuf {
     if let Some(v) = env::var_os("R5RUST_ASSETS").filter(|v| !v.is_empty()) {
         return PathBuf::from(v);
@@ -152,7 +166,7 @@ fn assets_root(root: &Path) -> PathBuf {
             return PathBuf::from(v);
         }
     }
-    PathBuf::from(DEFAULT_ASSETS)
+    if is_dev_root(root) { PathBuf::from(DEFAULT_ASSETS) } else { crate::update::data_root().join("assets") }
 }
 
 /// The map the game loads: r5rust.toml `map`, else the first `bsp` in content\maps, else the Firing Range.
@@ -370,10 +384,14 @@ impl Snapshot {
             return snap;
         }
         snap.files = GameFiles::read(root);
+        snap.dev = is_dev_root(root);
         snap.current = Build::read(&root.join("play/current/version.txt"));
         snap.next = Build::read(&root.join("play/next/version.txt"))
             .filter(|_| root.join("play/next/r5rust.exe").is_file());
-        if root.join(".git").exists() {
+        if !snap.dev {
+            // a downloaded build carries its own patch notes
+            snap.commits = Arc::new(read_notes(&root.join("notes.json")));
+        } else if root.join(".git").exists() {
             snap.commits = Arc::new(git_log(root, HISTORY_LEN));
             if let Some(newest) = snap.newest() {
                 snap.unbuilt = git(root, &["rev-list", "--count", &format!("{}..HEAD", newest.hash)])
@@ -437,6 +455,51 @@ fn git_log(root: &Path, count: usize) -> Vec<Commit> {
             })
         })
         .collect()
+}
+
+/// A downloaded build's patch notes (written by the game's tools\package.ps1 from its git log):
+/// `[{"hash", "date": "yyyy-MM-dd HH:mm", "subject", "body"}]`, newest first.
+fn read_notes(path: &Path) -> Vec<Commit> {
+    let Ok(text) = fs::read_to_string(path) else { return Vec::new() };
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')) else {
+        return Vec::new();
+    };
+    let today = days_since_epoch_now();
+    list.iter()
+        .filter_map(|n| {
+            let s = |k: &str| n.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let date = s("date");
+            let (day, time) = date.split_once(' ').unwrap_or((date.as_str(), ""));
+            let ago = match (today, days_from_ymd(day)) {
+                (Some(t), Some(d)) if t >= d => match t - d {
+                    0 => "today".to_owned(),
+                    1 => "yesterday".to_owned(),
+                    n => format!("{n} days ago"),
+                },
+                _ => String::new(),
+            };
+            Some(Commit { hash: s("hash"), day: day.to_owned(), time: time.to_owned(), ago, subject: s("subject"), body: parse_body(&s("body")) })
+        })
+        .filter(|c| !c.hash.is_empty())
+        .collect()
+}
+
+fn days_since_epoch_now() -> Option<i64> {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(secs.div_euclid(86_400))
+}
+
+/// Days since 1970-01-01 for `yyyy-mm-dd` (Howard Hinnant's days_from_civil).
+fn days_from_ymd(day: &str) -> Option<i64> {
+    let mut it = day.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (it.next()??, it.next()??, it.next()??);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 /// A commit body as notes: `- ` bullets with their wrapped continuation lines joined, other lines as their own note.
@@ -592,7 +655,7 @@ impl Job {
         }
         let log = Arc::new(Mutex::new(fs::File::create(&log_path).ok()));
 
-        let mut command = quiet("pwsh");
+        let mut command = quiet(pwsh(root));
         command
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&script)
@@ -868,7 +931,7 @@ fn run_install_script(root: &Path, args: &[&str]) -> Result<Vec<String>, String>
     if !script.is_file() {
         return Err(format!("{} is missing (update the game)", script.display()));
     }
-    let out = quiet("pwsh")
+    let out = quiet(pwsh(root))
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .args(args)
@@ -953,7 +1016,11 @@ pub fn load_game_root() -> PathBuf {
             }
         }
     }
-    PathBuf::from(DEFAULT_GAME_DIR)
+    // Kainz's dev checkout when it's there; everyone else plays from %LOCALAPPDATA%\R5Rust\game
+    if Path::new(DEFAULT_GAME_DIR).join("play.ps1").is_file() {
+        return PathBuf::from(DEFAULT_GAME_DIR);
+    }
+    crate::update::player_game_root()
 }
 
 /// The last lines of a log this launcher wrote earlier (game.log / build.log), so the Console isn't empty after a restart.
