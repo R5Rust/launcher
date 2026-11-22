@@ -720,7 +720,8 @@ impl eframe::App for LauncherApp {
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Backdrop: Kainz's grunge texture stretched to cover the window, a vignette, and two faint accent slashes.
+// Backdrop: Kainz's grunge texture (toned down) stretched to cover the window, and a vignette. No decorative shapes:
+// red is only for real UI accents (Kainz, 2026-11-21: diagonal streaks read as AI slop).
 
 impl LauncherApp {
     fn paint_backdrop(&self, ctx: &egui::Context) {
@@ -728,12 +729,8 @@ impl LauncherApp {
         let p = ctx.layer_painter(egui::LayerId::background());
         p.rect_filled(screen, Rounding::ZERO, BG);
         if let Some((tex, size)) = &self.backdrop {
-            p.image(tex.id(), screen, cover_uv(*size, screen.size()), Color32::WHITE);
+            p.image(tex.id(), screen, cover_uv(*size, screen.size()), Color32::from_gray(200));
         }
-        // accent slashes in the top-right corner (behind the page, seen in the gaps between cards)
-        let tr = screen.right_top();
-        paint_slash(&p, tr + Vec2::new(-150.0, 330.0), tr + Vec2::new(150.0, -40.0), 64.0, glass(ACCENT, 30));
-        paint_slash(&p, tr + Vec2::new(-262.0, 330.0), tr + Vec2::new(10.0, -10.0), 14.0, glass(ACCENT, 22));
         // vignette
         let edge = 180.0;
         let dark = Color32::from_black_alpha(110);
@@ -743,20 +740,6 @@ impl LauncherApp {
         paint_gradient(&p, Rect::from_min_max(Pos2::new(s.left(), s.bottom() - edge), s.max), [clear, clear, dark, dark]);
         paint_gradient(&p, Rect::from_min_max(Pos2::new(s.right() - edge, s.top()), s.max), [clear, dark, dark, clear]);
     }
-}
-
-/// A straight band from `a` (at `color`) fading out towards `b`.
-fn paint_slash(p: &egui::Painter, a: Pos2, b: Pos2, width: f32, color: Color32) {
-    let dir = (b - a).normalized();
-    let n = Vec2::new(-dir.y, dir.x) * (width / 2.0);
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(a + n, color);
-    mesh.colored_vertex(a - n, color);
-    mesh.colored_vertex(b - n, Color32::TRANSPARENT);
-    mesh.colored_vertex(b + n, Color32::TRANSPARENT);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    p.add(egui::Shape::mesh(mesh));
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -877,10 +860,6 @@ impl LauncherApp {
                 let full = ui.max_rect();
                 let p = ui.painter().clone();
                 p.vline(full.right() - 0.5, full.y_range(), Stroke::new(1.0_f32, BORDER));
-                // two faint accent slashes in the rail's empty lower half
-                let bl = Pos2::new(full.left(), full.bottom() - FOOTER_H);
-                paint_slash(&p, bl + Vec2::new(-30.0, 10.0), bl + Vec2::new(230.0, -300.0), 58.0, glass(ACCENT, 34));
-                paint_slash(&p, bl + Vec2::new(70.0, 10.0), bl + Vec2::new(250.0, -200.0), 12.0, glass(ACCENT, 26));
 
                 // brand: the game's banner logo, drawn exactly as in v0.2 (Kainz's call: keep it, don't recolour it)
                 ui.add_space(38.0);
@@ -1200,8 +1179,6 @@ impl LauncherApp {
                 let p = ui.painter();
                 p.rect_filled(rect, Rounding::same(rounding), RAISED);
                 let clip = p.with_clip_rect(rect);
-                let w = rect.width();
-                paint_slash(&clip, rect.left_bottom() + Vec2::new(w * 0.05, 0.0), rect.right_top() - Vec2::new(w * 0.2, 0.0), w * 0.12, glass(ACCENT, 26));
                 let m = rect.height().min(rect.width()) * 0.34;
                 clip.image(
                     self.mark.id(),
@@ -1254,42 +1231,45 @@ impl LauncherApp {
             self.mode_menu_open = !self.mode_menu_open;
         }
 
+        // The install card (below) covers the art; the title block stays out of its way then.
+        let show = phase == PlayPhase::Idle && (self.install_job.is_some() || self.install_open || (snap.is_ready() && !snap.files.ok()));
         // Title block, built up from the bottom edge
         let x = hero.left() + SP_2XL + 2.0;
-        let meta_y = hero.bottom() - SP_2XL;
-        let meta = painter.text(
-            Pos2::new(x, meta_y),
-            Align2::LEFT_BOTTOM,
-            format!("LOCAL SESSION   /   SOLO   /   {}", snap.files.map),
-            FontId::monospace(11.5),
-            MUTED,
-        );
-        let tagline = painter.text(
-            Pos2::new(x, meta.top() - SP_M),
-            Align2::LEFT_BOTTOM,
-            "Move freely. Practice your movement. Make the range yours.",
-            FontId::proportional(15.5),
-            SECONDARY,
-        );
-        let title = painter.text(Pos2::new(x - 3.0, tagline.top() + 8.0), Align2::LEFT_BOTTOM, "FIRING RANGE", display_font(T_HERO), TEXT);
-        paint_caption(&painter, Pos2::new(x, title.top() + 12.0), Align2::LEFT_BOTTOM, "Training mode", ACCENT_HI);
-        if phase != PlayPhase::Idle {
-            let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) as f32 * 3.0).sin().abs();
-            let dot = Pos2::new(meta.right() + 24.0, meta.center().y);
-            painter.circle_filled(dot, 3.5, GOOD.gamma_multiply(pulse));
-            let text = match (phase, self.play_job.as_ref()) {
-                (PlayPhase::Starting, _) => "STARTING".to_owned(),
-                (_, Some(job)) => format!("IN GAME  {}", fmt_duration(job.elapsed())),
-                _ => "IN GAME".to_owned(),
-            };
-            painter.text(dot + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, text, FontId::monospace(11.5), GOOD);
-            ctx.request_repaint_after(Duration::from_millis(50));
+        if !show {
+            let meta_y = hero.bottom() - SP_2XL;
+            let meta = painter.text(
+                Pos2::new(x, meta_y),
+                Align2::LEFT_BOTTOM,
+                format!("LOCAL SESSION   /   SOLO   /   {}", snap.files.map),
+                FontId::monospace(11.5),
+                MUTED,
+            );
+            let tagline = painter.text(
+                Pos2::new(x, meta.top() - SP_M),
+                Align2::LEFT_BOTTOM,
+                "Move freely. Practice your movement. Make the range yours.",
+                FontId::proportional(15.5),
+                SECONDARY,
+            );
+            let title = painter.text(Pos2::new(x - 3.0, tagline.top() + 8.0), Align2::LEFT_BOTTOM, "FIRING RANGE", display_font(T_HERO), TEXT);
+            paint_caption(&painter, Pos2::new(x, title.top() + 12.0), Align2::LEFT_BOTTOM, "Training mode", ACCENT_HI);
+            if phase != PlayPhase::Idle {
+                let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) as f32 * 3.0).sin().abs();
+                let dot = Pos2::new(meta.right() + 24.0, meta.center().y);
+                painter.circle_filled(dot, 3.5, GOOD.gamma_multiply(pulse));
+                let text = match (phase, self.play_job.as_ref()) {
+                    (PlayPhase::Starting, _) => "STARTING".to_owned(),
+                    (_, Some(job)) => format!("IN GAME  {}", fmt_duration(job.elapsed())),
+                    _ => "IN GAME".to_owned(),
+                };
+                painter.text(dot + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, text, FontId::monospace(11.5), GOOD);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
         }
 
         // Game files: one card, like R5Regenis' first-run card. It's the install form until the files are there, the
         // progress while installing, and comes back from Settings for a reinstall / update.
         let browse = false;
-        let show = phase == PlayPhase::Idle && (self.install_job.is_some() || self.install_open || (snap.is_ready() && !snap.files.ok()));
         if show {
             painter.rect_filled(hero, Rounding::same(R_CARD), shade(120));
             // centred on the art, using last frame's height (the card grows while installing)
@@ -1303,7 +1283,6 @@ impl LauncherApp {
                     ui.set_width(card.width() - 56.0);
                     self.install_card(ui, ctx, snap);
                 });
-                accent_edge(ui.painter(), r.response.rect);
                 ctx.data_mut(|d| d.insert_temp(h_id, r.response.rect.height()));
             });
         }
@@ -2031,14 +2010,14 @@ fn update_row(ui: &mut egui::Ui, u: &Update, open: bool, nc: &NoteCtx) -> bool {
                 let p = ui.painter();
                 p.rect(tile, Rounding::same(R_CTRL), RAISED, Stroke::new(1.0_f32, BORDER));
                 p.text(tile.center() - Vec2::new(0.0, 6.0), Align2::CENTER_CENTER, &day_num, display_font(26.0), TEXT);
-                paint_caption(p, tile.center() + Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, &month, ACCENT_HI);
+                paint_caption(p, tile.center() + Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, &month, MUTED);
 
                 let right_w = 330.0;
                 let text_w = (ui.available_width() - right_w).max(200.0);
                 ui.allocate_ui_with_layout(Vec2::new(text_w, head_h - 2.0 * SP_M), Layout::top_down(Align::Min).with_main_align(Align::Center), |ui| {
                     ui.set_width(text_w);
                     ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(RichText::new(format!("UPDATE {version}")).font(display_font(T_TITLE)).color(ACCENT_HI));
+                    ui.label(RichText::new(format!("UPDATE {version}")).font(display_font(T_TITLE)).color(SECONDARY));
                     ui.add(egui::Label::new(RichText::new(headline(&u.commits[0].1.subject)).size(T_BODY + 1.5).color(TEXT)).truncate());
                     let rest: Vec<String> = {
                         let mut seen = vec![headline(&u.commits[0].1.subject)];
@@ -2085,7 +2064,6 @@ fn update_row(ui: &mut egui::Ui, u: &Update, open: bool, nc: &NoteCtx) -> bool {
     if hovered > 0.0 {
         ui.painter().rect_stroke(card, Rounding::same(R_CARD), Stroke::new(1.0_f32, glass(Color32::from_rgb(90, 96, 108), (hovered * 255.0) as u8)));
     }
-    accent_edge(ui.painter(), card);
     resp.clicked()
 }
 
