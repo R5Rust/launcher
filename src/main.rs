@@ -1394,7 +1394,6 @@ impl LauncherApp {
 
         // Maps: a pill in the top-right corner of the art (like R5Flowstate's "All N maps"), opening the mode's map list
         let maps = MODES[self.mode].maps;
-        let mut pill_clicked = false;
         if !show {
             let text = format!("All {} maps", maps.len());
             let galley = painter.layout_no_wrap(text, FontId::proportional(T_BODY - 0.5), TEXT);
@@ -1412,7 +1411,7 @@ impl LauncherApp {
             );
             paint_icon(&painter, Icon::Grid, Pos2::new(pill_rect.left() + 22.0, pill_rect.center().y), 14.0, TEXT);
             painter.galley(Pos2::new(pill_rect.left() + 36.0, pill_rect.center().y - galley.size().y / 2.0), galley, TEXT);
-            pill_clicked = r.clicked();
+            let pill_clicked = r.clicked();
             if pill_clicked {
                 self.maps_open = !self.maps_open;
                 self.mode_menu_open = false;
