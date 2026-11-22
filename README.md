@@ -1,8 +1,26 @@
 # R5Rust Launcher
 
-A Windows desktop launcher for the separate `r5rust` game project (`C:\Code\games\r5rust`). Pick the mode, see what
-build you're on, build the latest code, play, and watch the game's output live. It launches through the game's own
-`play.ps1`, so the game's update-and-launch flow stays in charge.
+**[Download R5Rust Launcher for Windows](https://github.com/R5Rust/launcher/releases/latest/download/R5Rust-Launcher.exe)**
+(one exe, always the newest version)
+
+1. Run `R5Rust-Launcher.exe`. It installs itself (Start menu + desktop shortcut, uninstall from Apps & features) and
+   opens. Windows may show "Windows protected your PC" because the exe isn't code-signed: **More info > Run anyway**.
+2. **Download** gets the newest game build. Later, the same button says **Update** when there's a newer one; the
+   launcher updates itself too (the version in the bottom left turns into an **Update** button).
+3. **Install** builds the game files from **your own Apex Legends install** (Apex must be closed; R5Rust ships no game
+   files). Takes a while, once.
+4. **Play**.
+
+Everything lives in `%LOCALAPPDATA%\R5Rust` (game, built files) and `%LOCALAPPDATA%\Programs\R5Rust Launcher`.
+
+---
+
+## For developers
+
+A Windows desktop launcher for the `r5rust` game project. With a dev checkout (`C:\Code\games\r5rust`, git +
+`tools\publish.ps1`) it builds the latest code with cargo; for players it downloads builds from GitHub Releases
+(player mode, `src\update.rs`). Either way it launches through the game's own `play.ps1`, so the game's
+update-and-launch flow stays in charge.
 
 The launcher ships **no game files or game art**. The Play page shows the map's real loading screen read from your own
 extracted assets (`<assets>\images\ui\maps_<map>_loadscreen\`), like R5Regenis' and R5Flowstate's launchers do; without
@@ -92,6 +110,19 @@ Ideas taken from the reference launchers: R5Regenis (layout, map art from the in
 R5Flowstate (Console tab, Play becomes Stop, launch-args preview, plain-sentence status line), R5Reloaded (verify game
 files).
 
+## Releasing
+
+- **Launcher:** bump `version` in Cargo.toml, build with paths remapped
+  (`$env:CARGO_TARGET_DIR='D:\R5Rust\_build\launcher'; $env:RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=~ --remap-path-prefix=C:\Code=src"; cargo build --release`),
+  then `gh release create v<version> <exe>#R5Rust-Launcher.exe -R R5Rust/launcher` with the asset **named
+  `R5Rust-Launcher.exe`** (the download link and the self-updater look for that name / any `.exe`). Installed
+  launchers offer the update on their next start.
+- **Game build:** `pwsh tools\package.ps1 -Publish` in the game repo (release `build-<date>-<hash>` on R5Rust/R5Rust).
+- **Install tools:** `pwsh tools\bundle_tools.ps1` in the game repo makes `r5rust-tools-<n>.zip`; publish it as release
+  `tools-<n>` on R5Rust/R5Rust and package game builds with `-Tools <n>`.
+- Player mode is used when the game folder isn't a dev checkout. Test it without touching your own setup by pointing
+  `APPDATA` / `LOCALAPPDATA` at empty folders and writing `game_path.txt` there; `--portable` skips the self-install,
+  `--check-updates` lets a `--screenshot` run reach GitHub, `--download` presses Download once possible.
 ## Code
 
 - `src\main.rs`: the UI (egui 0.28 / eframe).
@@ -109,7 +140,9 @@ files).
 - Patch-note "versions" are dates (`UPDATE 26.11.21`): R5Rust has no version numbers, so a day of commits is an update.
   Older updates have a date tile instead of a picture (the launcher only has the one map's loading screen).
 - Only Firing Range. More modes, a map picker and mods would follow the game.
-- No self-update, no installer: run it from cargo or copy `target\release\r5rust-launcher.exe`.
+- v0.4.0: player mode (downloads, updates, self-install, self-update, uninstall). The exe isn't code-signed, so
+  SmartScreen warns on first run. The in-game HUD (RUI host) needs Node + Flowstate's ui.dll, which players don't have:
+  the game runs without it.
 - Install builds the map from Apex; the first-person items (R-99, arms, heirlooms, sounds, decals, effects) aren't in
   it yet. It still needs the dev tools on this PC (RSX fork, extractor, dxc, Python, cargo): bundling them so a
   friend's PC needs nothing else is the next step (the game's `tools\bin\` is already checked first).

@@ -1012,6 +1012,14 @@ impl eframe::App for LauncherApp {
             self.autodownloaded = true;
             action.build = true;
         }
+        // `--update-launcher`: take a newer launcher once the check finds one (scripted tests of the self-update)
+        if self.update_task.is_none() && !self.autodownloaded && std::env::args().any(|a| a == "--update-launcher") && !update::is_dev_exe() {
+            let has = self.feed.lock().unwrap().launcher_update().is_some();
+            if has {
+                self.autodownloaded = true;
+                self.update_launcher(ctx);
+            }
+        }
         if self.autoplay && can_play {
             self.autoplay = false;
             action.play = true;

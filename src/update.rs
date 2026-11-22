@@ -399,6 +399,10 @@ fn quiet(program: &str) -> Command {
 
 /// Start menu + desktop shortcuts and an Apps & features entry for the installed exe.
 fn register(exe: &Path) {
+    // tests in a sandbox (fake LOCALAPPDATA): shortcuts and the registry entry would land on the real desktop
+    if env::var_os("R5RUST_TEST_NOREG").is_some() {
+        return;
+    }
     let exe_s = exe.to_string_lossy().replace('\'', "''");
     let ps = format!(
         "$w = New-Object -ComObject WScript.Shell; \
@@ -426,7 +430,7 @@ fn register(exe: &Path) {
 /// First run of a downloaded launcher: copy it to the install folder, add shortcuts, start that copy.
 /// Returns true when this process should exit (the installed copy is starting).
 pub fn self_install() -> bool {
-    if is_dev_exe() || env::args().any(|a| a == "--portable" || a.starts_with("--screenshot")) {
+    if is_dev_exe() || env::args().any(|a| a == "--portable") {
         return false;
     }
     let Ok(exe) = env::current_exe() else { return false };
