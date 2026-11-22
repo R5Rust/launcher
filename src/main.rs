@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod game;
+mod presence;
 mod update;
 
 use std::{
@@ -416,6 +417,9 @@ struct LauncherApp {
     /// A download running in the background (a game build, or a launcher update).
     update_task: Option<(UpdateKind, update::Task)>,
     autodownloaded: bool,
+    /// Discord Rich Presence while the game runs (Settings > Launcher; discord_rpc.txt, on unless "0").
+    presence: presence::Presence,
+    rpc_on: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -515,6 +519,8 @@ impl LauncherApp {
             feed: Arc::new(Mutex::new(update::Feed::default())),
             update_task: None,
             autodownloaded: false,
+            presence: presence::Presence::start(),
+            rpc_on: game::read_setting("discord_rpc.txt").is_none_or(|v| v != "0"),
         };
         // what's on GitHub (screenshots stay offline unless asked: `--check-updates`)
         if app.screenshot.is_none() || std::env::args().any(|a| a == "--check-updates") {
@@ -960,6 +966,12 @@ impl eframe::App for LauncherApp {
         self.sync_install(&snap);
         self.paint_backdrop(ctx);
         let phase = self.phase(&snap);
+        // Discord: "Playing R5Rust / Firing Range / Loading into Game" while it starts, "In Game" once it's up
+        let rpc = (self.rpc_on && self.screenshot.is_none() && phase != PlayPhase::Idle).then(|| presence::Playing {
+            map: MODES[self.mode].maps.iter().find(|m| m.playable).map_or(MODES[self.mode].name, |m| m.name).to_owned(),
+            state: if phase == PlayPhase::Starting { "Loading into Game" } else { "In Game" }.to_owned(),
+        });
+        self.presence.set(rpc);
         let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
         self.poll_update(ctx);
         let can_build = if snap.dev {
@@ -3924,6 +3936,16 @@ impl LauncherApp {
                 });
 
                 section(ui, "LAUNCHER", None, |ui| {
+                    if toggle_row(
+                        ui,
+                        &mut self.rpc_on,
+                        "Discord Rich Presence",
+                        "Show \"Playing R5Rust\" on your Discord profile while the game runs.",
+                        true,
+                    ) && let Err(e) = game::write_setting("discord_rpc.txt", if self.rpc_on { "1" } else { "0" })
+                    {
+                        err = Some(format!("Couldn't save: {e}"));
+                    }
                     if toggle_row(
                         ui,
                         &mut self.console_on_launch,
