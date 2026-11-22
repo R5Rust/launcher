@@ -386,7 +386,11 @@ pub fn install_dir() -> PathBuf {
 /// Running from a cargo `target` folder (Kainz's dev copy): never self-install or self-update.
 pub fn is_dev_exe() -> bool {
     env::current_exe()
-        .map(|e| e.components().any(|c| c.as_os_str().eq_ignore_ascii_case("target")))
+        .map(|e| {
+            e.components().any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
+                // any cargo output folder (CARGO_TARGET_DIR elsewhere, e.g. D:\R5Rust\_build\...) has .fingerprint
+                || e.parent().is_some_and(|d| d.join(".fingerprint").is_dir())
+        })
         .unwrap_or(true)
 }
 

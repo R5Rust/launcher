@@ -624,6 +624,8 @@ pub enum JobKind {
     Build,
     /// tools\install.ps1: builds the game files from the player's own Apex install.
     Install,
+    /// tools\push.ps1: releases the build you're playing to players (dev).
+    Push,
 }
 
 pub struct Job {
@@ -649,6 +651,7 @@ impl Job {
             JobKind::Play => root.join("play.ps1"),
             JobKind::Build => root.join("tools").join("publish.ps1"),
             JobKind::Install => root.join("tools").join("install.ps1"),
+            JobKind::Push => root.join("tools").join("push.ps1"),
         };
         if !script.is_file() {
             return Err(format!("{} is missing", script.display()));

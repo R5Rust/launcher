@@ -317,6 +317,7 @@ struct FooterAction {
     play: bool,
     stop: bool,
     build: bool,
+    push: bool,
 }
 
 /// The Console's filtered view, kept between frames: only new lines are scanned while the filter stays the same.
@@ -420,8 +421,10 @@ struct LauncherApp {
     /// player mode: last GitHub check, and the updates already tried automatically (once each)
     last_check: Instant,
     auto_tried: HashSet<String>,
-    /// dev mode: Build latest also shares the build with players (share_builds.txt, on unless "0")
-    share_builds: bool,
+    /// dev mode: Push build (the dialog, its patch notes, and the push job)
+    push_open: bool,
+    push_notes: String,
+    push_job: Option<Job>,
     /// frames spent waiting on a scripted --download / --update-launcher in --screenshot mode
     test_wait: u32,
     /// Discord Rich Presence while the game runs (Settings > Launcher; discord_rpc.txt, on unless "0").
@@ -528,7 +531,10 @@ impl LauncherApp {
             autodownloaded: false,
             last_check: Instant::now(),
             auto_tried: HashSet::new(),
-            share_builds: game::read_setting("share_builds.txt").is_none_or(|v| v != "0"),
+            // `--open-push`: open the Push build dialog on start (screenshots)
+            push_open: std::env::args().any(|a| a == "--open-push"),
+            push_notes: String::new(),
+            push_job: None,
             test_wait: 0,
             presence: presence::Presence::start(),
             rpc_on: game::read_setting("discord_rpc.txt").is_none_or(|v| v != "0"),
@@ -650,8 +656,7 @@ impl LauncherApp {
     }
 
     fn build(&mut self, ctx: &egui::Context) {
-        let args = if self.share_builds { vec![] } else { vec!["-NoShare".to_owned()] };
-        match Job::start(JobKind::Build, &self.game_root, &args, game::log_path("build.log"), ctx.clone()) {
+        match Job::start(JobKind::Build, &self.game_root, &[], game::log_path("build.log"), ctx.clone()) {
             Ok(job) => {
                 self.build_job = Some(job);
                 self.build_panel_open = true;
@@ -863,6 +868,16 @@ impl LauncherApp {
             };
             self.poller.refresh();
         }
+        if let Some(job) = &mut self.push_job
+            && job.poll()
+        {
+            self.notice = if job.succeeded() {
+                Some(("Build pushed: players' launchers pick it up by themselves, and #patch-notes has it.".into(), Tone::Good))
+            } else {
+                let why = job.failure_line().unwrap_or_else(|| "see push.log".into());
+                Some((format!("Push failed: {why}"), Tone::Bad))
+            };
+        }
         if let Some(job) = &mut self.install_job
             && job.poll()
         {
@@ -878,7 +893,7 @@ impl LauncherApp {
             self.poller.refresh();
             self.check_install(ctx, PathBuf::from(&self.install_dir));
         }
-        if self.play_job.is_some() || self.building() || self.installing() {
+        if self.play_job.is_some() || self.building() || self.installing() || self.push_job.as_ref().is_some_and(Job::running) {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
@@ -1073,6 +1088,9 @@ impl eframe::App for LauncherApp {
         if self.build_panel_open && self.build_job.is_some() {
             self.build_panel(ctx);
         }
+        if self.push_open {
+            self.push_dialog(ctx, &snap);
+        }
         match draw_window_chrome(ctx, self.restore_rect.is_some()) {
             ChromeAction::None => {}
             ChromeAction::ToggleMaximize => self.toggle_maximize(ctx),
@@ -1107,6 +1125,9 @@ impl eframe::App for LauncherApp {
         }
         if action.stop {
             self.stop();
+        }
+        if action.push {
+            self.push_open = true;
         }
         if action.play {
             self.launch(ctx);
@@ -1493,9 +1514,110 @@ impl LauncherApp {
                 }
                 ui.add_space(SP_M);
                 action.build = self.build_button(ui, snap, can_build);
+                if snap.dev {
+                    ui.add_space(SP_M);
+                    action.push = self.push_button(ui, snap);
+                }
             });
         });
         action
+    }
+
+    /// Dev: "PUSH BUILD": sends players the build you're playing (opens the patch-notes dialog first).
+    fn push_button(&self, ui: &mut egui::Ui, snap: &Snapshot) -> bool {
+        let pushing = self.push_job.as_ref().is_some_and(Job::running);
+        let enabled = snap.current.is_some() && !pushing;
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(150.0, 56.0), Sense::click());
+        let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
+        let hover = ui.ctx().animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
+        let p = ui.painter();
+        p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), mix(RAISED, HOVER, hover), Stroke::new(1.0_f32, mix(BORDER, Color32::from_rgb(70, 76, 86), hover)));
+        let (title, detail, dc) = match (&self.push_job, &snap.current) {
+            (Some(j), _) if j.running() => ("PUSHING", fmt_duration(j.elapsed()), SECONDARY),
+            (_, Some(b)) => ("PUSH BUILD", format!("{} to players", b.hash), MUTED),
+            (_, None) => ("PUSH BUILD", "play a build first".to_owned(), MUTED),
+        };
+        p.text(rect.left_top() + Vec2::new(SP_L, 10.0), Align2::LEFT_TOP, title, display_font(T_TITLE + 2.0), if enabled || pushing { TEXT } else { MUTED });
+        p.text(rect.left_top() + Vec2::new(SP_L, 34.0), Align2::LEFT_TOP, detail, FontId::proportional(11.5), dc);
+        if pushing {
+            paint_progress_line(ui, rect, ACCENT_HI);
+        }
+        enabled && response.clicked()
+    }
+
+    /// The Push build dialog: which build goes out, its patch notes (one short line each), Push / Cancel.
+    fn push_dialog(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        let Some(build) = snap.current.clone() else {
+            self.push_open = false;
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let size = Vec2::new(560.0, 360.0);
+        let pos = screen.center() - size / 2.0;
+        let (mut push, mut cancel) = (false, false);
+        egui::Area::new(egui::Id::new("push-dim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter().rect_filled(r, Rounding::ZERO, Color32::from_black_alpha(150));
+            cancel |= resp.clicked();
+        });
+        egui::Area::new(egui::Id::new("push-dialog")).order(egui::Order::Tooltip).fixed_pos(pos).show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(Color32::from_rgba_unmultiplied(14, 15, 18, 250))
+                .stroke(Stroke::new(1.0_f32, BORDER))
+                .rounding(Rounding::same(R_CARD))
+                .inner_margin(Margin::same(SP_L))
+                .show(ui, |ui| {
+                    ui.set_width(size.x - 2.0 * SP_L);
+                    ui.spacing_mut().item_spacing.y = SP_S;
+                    ui.label(RichText::new("PUSH BUILD TO PLAYERS").font(display_font(T_TITLE + 4.0)).color(TEXT));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&build.hash).monospace().size(T_BODY).color(ACCENT_HI));
+                        ui.add(egui::Label::new(RichText::new(&build.subject).size(T_BODY).color(SECONDARY)).truncate());
+                    });
+                    ui.label(
+                        RichText::new("The build you're playing goes out exactly as it is. Players' launchers download it by themselves; R5Rust Bot posts it in #patch-notes.")
+                            .size(T_SMALL)
+                            .color(MUTED),
+                    );
+                    ui.add_space(SP_XS);
+                    ui.label(caption("PATCH NOTES").color(SECONDARY));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.push_notes)
+                            .hint_text("One short line per change, like:\nFixed the sun flickering\nZiplines are faster to grab")
+                            .desired_rows(6)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(SP_XS);
+                    ui.horizontal(|ui| {
+                        push = big_button(ui, "PUSH", BigStyle::Primary, true).clicked();
+                        ui.add_space(SP_M);
+                        cancel |= ghost_button(ui, "Cancel", None);
+                    });
+                });
+        });
+        if cancel || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.push_open = false;
+        }
+        if push {
+            self.push_open = false;
+            self.start_push(ctx);
+        }
+    }
+
+    fn start_push(&mut self, ctx: &egui::Context) {
+        let notes = game::log_path("push-notes.txt");
+        if let Err(e) = std::fs::write(&notes, &self.push_notes) {
+            self.notice = Some((format!("Couldn't save the patch notes: {e}"), Tone::Bad));
+            return;
+        }
+        let args = vec!["-NotesFile".to_owned(), notes.display().to_string()];
+        match Job::start(JobKind::Push, &self.game_root, &args, game::log_path("push.log"), ctx.clone()) {
+            Ok(job) => {
+                self.push_job = Some(job);
+                self.notice = Some(("Pushing the build to players...".into(), Tone::Info));
+            }
+            Err(e) => self.notice = Some((e, Tone::Bad)),
+        }
     }
 
     /// The footer's one-sentence status, most important first.
@@ -4006,18 +4128,6 @@ impl LauncherApp {
                         "Show \"Playing R5Rust\" on your Discord profile while the game runs.",
                         true,
                     ) && let Err(e) = game::write_setting("discord_rpc.txt", if self.rpc_on { "1" } else { "0" })
-                    {
-                        err = Some(format!("Couldn't save: {e}"));
-                    }
-                    if snap.dev
-                        && toggle_row(
-                            ui,
-                            &mut self.share_builds,
-                            "Share builds with players",
-                            "Build latest also publishes the build: players' launchers download it and R5Rust Bot posts it in #patch-notes.",
-                            true,
-                        )
-                        && let Err(e) = game::write_setting("share_builds.txt", if self.share_builds { "1" } else { "0" })
                     {
                         err = Some(format!("Couldn't save: {e}"));
                     }
