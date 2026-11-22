@@ -1583,6 +1583,16 @@ impl LauncherApp {
                             .size(T_SMALL)
                             .color(MUTED),
                     );
+                    if let Some(next) = &snap.next {
+                        ui.label(
+                            RichText::new(format!(
+                                "A newer build ({}) is staged but you haven't played it yet. To push that one: close this, press Play, try it, then push.",
+                                next.hash
+                            ))
+                            .size(T_SMALL)
+                            .color(AMBER),
+                        );
+                    }
                     ui.add_space(SP_XS);
                     ui.label(caption("PATCH NOTES").color(SECONDARY));
                     ui.add(
