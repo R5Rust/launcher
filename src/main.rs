@@ -12,7 +12,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
@@ -417,6 +417,11 @@ struct LauncherApp {
     /// A download running in the background (a game build, or a launcher update).
     update_task: Option<(UpdateKind, update::Task)>,
     autodownloaded: bool,
+    /// player mode: last GitHub check, and the updates already tried automatically (once each)
+    last_check: Instant,
+    auto_tried: HashSet<String>,
+    /// dev mode: Build latest also shares the build with players (share_builds.txt, on unless "0")
+    share_builds: bool,
     /// frames spent waiting on a scripted --download / --update-launcher in --screenshot mode
     test_wait: u32,
     /// Discord Rich Presence while the game runs (Settings > Launcher; discord_rpc.txt, on unless "0").
@@ -521,6 +526,9 @@ impl LauncherApp {
             feed: Arc::new(Mutex::new(update::Feed::default())),
             update_task: None,
             autodownloaded: false,
+            last_check: Instant::now(),
+            auto_tried: HashSet::new(),
+            share_builds: game::read_setting("share_builds.txt").is_none_or(|v| v != "0"),
             test_wait: 0,
             presence: presence::Presence::start(),
             rpc_on: game::read_setting("discord_rpc.txt").is_none_or(|v| v != "0"),
@@ -642,7 +650,8 @@ impl LauncherApp {
     }
 
     fn build(&mut self, ctx: &egui::Context) {
-        match Job::start(JobKind::Build, &self.game_root, &[], game::log_path("build.log"), ctx.clone()) {
+        let args = if self.share_builds { vec![] } else { vec!["-NoShare".to_owned()] };
+        match Job::start(JobKind::Build, &self.game_root, &args, game::log_path("build.log"), ctx.clone()) {
             Ok(job) => {
                 self.build_job = Some(job);
                 self.build_panel_open = true;
@@ -664,8 +673,40 @@ impl LauncherApp {
     fn available_build(&self, snap: &Snapshot) -> Option<update::Release> {
         let feed = self.feed.lock().unwrap();
         let latest = feed.newest_build()?;
+        // the release tag the folder was unpacked from (release.txt); older zips had none: compare the commit hash
+        if let Some(have) = &snap.release {
+            return (*have != latest.tag).then(|| latest.clone());
+        }
         let have = snap.newest().map(|b| b.hash.as_str()).unwrap_or("");
         (have.is_empty() || !same_hash(have, latest.build_hash())).then(|| latest.clone())
+    }
+
+    /// Player mode, hands off: re-check GitHub every 30 minutes, take a new launcher at start, download new builds
+    /// as soon as they're out (play.ps1 swaps them in on the next Play). The buttons stay for doing it by hand.
+    fn auto_update(&mut self, ctx: &egui::Context, snap: &Snapshot, phase: PlayPhase) {
+        if snap.dev || self.screenshot.is_some() {
+            return;
+        }
+        if self.update_task.is_none() && self.last_check.elapsed() > Duration::from_secs(30 * 60) {
+            self.last_check = Instant::now();
+            update::check(ctx.clone(), self.feed.clone());
+        }
+        if self.update_task.is_some() || self.installing() || phase != PlayPhase::Idle {
+            return;
+        }
+        let (launcher_tag, build_tag) = {
+            let f = self.feed.lock().unwrap();
+            (f.launcher_update().map(|r| r.tag.clone()), f.newest_build().map(|r| r.tag.clone()))
+        };
+        // a newer launcher first (it restarts into itself), once per version so a failure can't loop
+        if let Some(tag) = launcher_tag.filter(|t| !update::is_dev_exe() && self.auto_tried.insert(format!("launcher {t}"))) {
+            let _ = tag;
+            self.update_launcher(ctx);
+            return;
+        }
+        if self.available_build(snap).is_some() && build_tag.is_some_and(|t| self.auto_tried.insert(format!("build {t}"))) {
+            self.update_game(ctx);
+        }
     }
 
     /// Downloads the newest build (and the install tools it needs) into the game folder, off the UI thread.
@@ -995,6 +1036,7 @@ impl eframe::App for LauncherApp {
         self.presence.set(rpc);
         let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
         self.poll_update(ctx);
+        self.auto_update(ctx, &snap, phase);
         let can_build = if snap.dev {
             matches!(snap.state, GameState::Ready | GameState::NoBuild)
                 && !self.building()
@@ -3964,6 +4006,18 @@ impl LauncherApp {
                         "Show \"Playing R5Rust\" on your Discord profile while the game runs.",
                         true,
                     ) && let Err(e) = game::write_setting("discord_rpc.txt", if self.rpc_on { "1" } else { "0" })
+                    {
+                        err = Some(format!("Couldn't save: {e}"));
+                    }
+                    if snap.dev
+                        && toggle_row(
+                            ui,
+                            &mut self.share_builds,
+                            "Share builds with players",
+                            "Build latest also publishes the build: players' launchers download it and R5Rust Bot posts it in #patch-notes.",
+                            true,
+                        )
+                        && let Err(e) = game::write_setting("share_builds.txt", if self.share_builds { "1" } else { "0" })
                     {
                         err = Some(format!("Couldn't save: {e}"));
                     }

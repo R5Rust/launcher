@@ -117,6 +117,8 @@ pub struct Snapshot {
     pub files: GameFiles,
     /// A dev checkout (cargo builds, git history) rather than a downloaded game.
     pub dev: bool,
+    /// The GitHub release a downloaded game folder was unpacked from (release.txt).
+    pub release: Option<String>,
 }
 
 /// The map the game loads and whether its extracted files are on disk.
@@ -385,6 +387,7 @@ impl Snapshot {
         }
         snap.files = GameFiles::read(root);
         snap.dev = is_dev_root(root);
+        snap.release = fs::read_to_string(root.join("release.txt")).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
         snap.current = Build::read(&root.join("play/current/version.txt"));
         snap.next = Build::read(&root.join("play/next/version.txt"))
             .filter(|_| root.join("play/next/r5rust.exe").is_file());
