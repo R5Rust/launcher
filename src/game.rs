@@ -21,7 +21,9 @@ pub const DEFAULT_GAME_DIR: &str = r"C:\Code\games\r5rust";
 const DEFAULT_ASSETS: &str = r"D:\R5Rust\assets";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL_EVERY: Duration = Duration::from_secs(3);
-const KEEP_LINES: usize = 5000;
+pub const KEEP_LINES: usize = 5000;
+/// How many commits Patch Notes reads (the oldest day is left out when the limit cuts it).
+pub const HISTORY_LEN: usize = 100;
 
 /// A command with no console window: the launcher is a GUI app, so every child would otherwise flash one.
 fn quiet(program: &str) -> Command {
@@ -74,6 +76,8 @@ pub struct Commit {
     pub time: String,
     pub ago: String,
     pub subject: String,
+    /// The commit message's body as notes: one entry per bullet / paragraph line (trailers like Co-Authored-By dropped).
+    pub body: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -94,7 +98,8 @@ pub struct Snapshot {
     pub next: Option<Build>,
     /// Commits newer than the newest staged build (None: no git, or the build's commit isn't in the history).
     pub unbuilt: Option<u32>,
-    pub commits: Vec<Commit>,
+    /// Shared so the UI's per-frame snapshot copy doesn't deep-copy 60 commit messages.
+    pub commits: Arc<Vec<Commit>>,
     /// An r5rust.exe is running (ours or not).
     pub running: bool,
     /// The extracted game files R5Rust loads (never shipped; made from the player's own Apex install).
@@ -364,7 +369,7 @@ impl Snapshot {
         snap.next = Build::read(&root.join("play/next/version.txt"))
             .filter(|_| root.join("play/next/r5rust.exe").is_file());
         if root.join(".git").exists() {
-            snap.commits = git_log(root, 60);
+            snap.commits = Arc::new(git_log(root, HISTORY_LEN));
             if let Some(newest) = snap.newest() {
                 snap.unbuilt = git(root, &["rev-list", "--count", &format!("{}..HEAD", newest.hash)])
                     .and_then(|n| n.trim().parse().ok());
@@ -405,16 +410,17 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_log(root: &Path, count: usize) -> Vec<Commit> {
-    let format = "--format=%h%x1f%ad%x1f%ar%x1f%s";
+    // fields split by 0x1f, commits by 0x1e (bodies have newlines)
+    let format = "--format=%h%x1f%ad%x1f%ar%x1f%s%x1f%b%x1e";
     let Some(text) =
         git(root, &["log", &format!("-n{count}"), format, "--date=format:%Y-%m-%d %H:%M"])
     else {
         return Vec::new();
     };
-    text.lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\u{1f}');
-            let hash = parts.next()?.to_owned();
+    text.split('\u{1e}')
+        .filter_map(|record| {
+            let mut parts = record.trim_start_matches(['\r', '\n']).split('\u{1f}');
+            let hash = parts.next()?.trim().to_owned();
             let (day, time) = parts.next()?.split_once(' ')?;
             Some(Commit {
                 hash,
@@ -422,9 +428,36 @@ fn git_log(root: &Path, count: usize) -> Vec<Commit> {
                 time: time.to_owned(),
                 ago: parts.next()?.to_owned(),
                 subject: parts.next().unwrap_or("").to_owned(),
+                body: parse_body(parts.next().unwrap_or("")),
             })
         })
         .collect()
+}
+
+/// A commit body as notes: `- ` bullets with their wrapped continuation lines joined, other lines as their own note.
+pub fn parse_body(body: &str) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+    let mut continuing = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed.is_empty() || lower.starts_with("co-authored-by:") || lower.starts_with("signed-off-by:") {
+            continuing = false;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            notes.push(rest.to_owned());
+            continuing = true;
+        } else if continuing && line.starts_with(char::is_whitespace) {
+            let last = notes.last_mut().expect("continuing implies a note");
+            last.push(' ');
+            last.push_str(trimmed);
+        } else {
+            notes.push(trimmed.to_owned());
+            continuing = false;
+        }
+    }
+    notes
 }
 
 #[cfg(windows)]
@@ -982,6 +1015,16 @@ mod tests {
     fn temp_root(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         env::temp_dir().join(format!("r5rust-launcher-{label}-{stamp}"))
+    }
+
+    #[test]
+    fn commit_body_becomes_notes() {
+        let body = "- Cables: 8-sided tube along the rest points,\n  probe lit, shadow casting.\n- Sounds: attach / loop.\nPlain line.\n\nCo-Authored-By: Someone <x@y>\n";
+        assert_eq!(
+            parse_body(body),
+            vec!["Cables: 8-sided tube along the rest points, probe lit, shadow casting.", "Sounds: attach / loop.", "Plain line."]
+        );
+        assert!(parse_body("Co-Authored-By: Someone <x@y>\n").is_empty());
     }
 
     #[test]

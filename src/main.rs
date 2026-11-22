@@ -3,6 +3,7 @@
 mod game;
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,26 +16,68 @@ use std::{
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
-use game::{GameSettings, GameState, InstallStatus, InstallView, Job, JobKind, Poller, Snapshot, StepState};
+use game::{Commit, GameSettings, GameState, InstallStatus, InstallView, Job, JobKind, Poller, Snapshot, StepState};
 
-const RAIL: Color32 = Color32::from_rgb(15, 21, 30);
-const BG: Color32 = Color32::from_rgb(20, 27, 38);
-const PANEL: Color32 = Color32::from_rgb(27, 36, 50);
-const RAISED: Color32 = Color32::from_rgb(38, 50, 68);
-const HOVER: Color32 = Color32::from_rgb(48, 62, 84);
-const TEXT: Color32 = Color32::from_rgb(242, 246, 250);
-const SECONDARY: Color32 = Color32::from_rgb(190, 201, 216);
-const MUTED: Color32 = Color32::from_rgb(138, 152, 171);
-const BORDER: Color32 = Color32::from_rgb(52, 66, 88);
-const CYAN: Color32 = Color32::from_rgb(63, 216, 255);
-const CYAN_HI: Color32 = Color32::from_rgb(124, 228, 255);
-const INK: Color32 = Color32::from_rgb(8, 19, 26);
-const AMBER: Color32 = Color32::from_rgb(255, 186, 82);
-const RED: Color32 = Color32::from_rgb(255, 107, 94);
+// -------------------------------------------------------------------------------------------------------------------
+// Design tokens. One charcoal ramp, one red accent, three status colours; every page uses these and nothing else.
 
-const RAIL_W: f32 = 228.0;
-const FOOTER_H: f32 = 94.0;
-const PAGE_MARGIN: Margin = Margin { left: 48.0, right: 48.0, top: 58.0, bottom: 0.0 };
+/// Surfaces, darkest to lightest.
+const BG: Color32 = Color32::from_rgb(11, 12, 14);
+const RAIL: Color32 = Color32::from_rgb(8, 9, 11);
+const PANEL: Color32 = Color32::from_rgb(20, 22, 25);
+const RAISED: Color32 = Color32::from_rgb(31, 34, 39);
+const HOVER: Color32 = Color32::from_rgb(44, 48, 55);
+const BORDER: Color32 = Color32::from_rgb(45, 49, 56);
+/// Text: primary, secondary, muted (captions, hints).
+const TEXT: Color32 = Color32::from_rgb(243, 244, 246);
+const SECONDARY: Color32 = Color32::from_rgb(188, 192, 199);
+const MUTED: Color32 = Color32::from_rgb(128, 134, 143);
+/// The accent: the active page, Play, selections, progress.
+const ACCENT: Color32 = Color32::from_rgb(226, 44, 52);
+const ACCENT_HI: Color32 = Color32::from_rgb(246, 74, 80);
+/// Behind active / selected things that aren't the primary action (the active nav item).
+const ACCENT_TINT: Color32 = Color32::from_rgb(58, 18, 22);
+/// Status (never the accent, so "error" and "selected" don't look alike).
+const GOOD: Color32 = Color32::from_rgb(98, 208, 142);
+const AMBER: Color32 = Color32::from_rgb(242, 180, 76);
+const BAD: Color32 = Color32::from_rgb(255, 128, 112);
+const INK: Color32 = Color32::from_rgb(10, 12, 14);
+/// The rail logo's text keeps its v0.2 colours exactly (the logo block is unchanged on purpose).
+const LOGO_TEXT: Color32 = Color32::from_rgb(242, 246, 250);
+const LOGO_MUTED: Color32 = Color32::from_rgb(138, 152, 171);
+
+/// Spacing scale (px): 4 / 8 / 12 / 16 / 24 / 32 / 48.
+const SP_XS: f32 = 4.0;
+const SP_S: f32 = 8.0;
+const SP_M: f32 = 12.0;
+const SP_L: f32 = 16.0;
+const SP_XL: f32 = 24.0;
+const SP_2XL: f32 = 32.0;
+const SP_3XL: f32 = 48.0;
+
+/// Corners: controls (buttons, chips, fields) and cards. Switches are pills.
+const R_CTRL: f32 = 3.0;
+const R_CARD: f32 = 4.0;
+
+/// Type scale. Barlow Condensed (display, always upper case) for short labels; Inter for sentences.
+const T_HERO: f32 = 76.0;
+const T_PAGE: f32 = 50.0;
+const T_UPDATE: f32 = 30.0;
+const T_SECTION: f32 = 21.0;
+const T_TITLE: f32 = 18.0;
+const T_BODY: f32 = 14.0;
+const T_SMALL: f32 = 12.5;
+const T_CAPTION: f32 = 11.0;
+const T_MONO: f32 = 12.5;
+
+const RAIL_W: f32 = 232.0;
+const FOOTER_H: f32 = 92.0;
+/// Every page's content gutter and top edge (under the window buttons).
+const GUTTER: f32 = 32.0;
+const PAGE_TOP: f32 = 48.0;
+const PAGE_MARGIN: Margin = Margin { left: GUTTER, right: GUTTER, top: PAGE_TOP, bottom: 0.0 };
+/// Settings label column.
+const LABEL_W: f32 = 180.0;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -97,8 +140,45 @@ fn load_window_icon() -> egui::IconData {
     egui::IconData { rgba: icon.into_raw(), width: 256, height: 256 }
 }
 
+/// The game's white gear mark (from the launcher icon) as a white-on-transparent texture, so it can sit on any colour.
+fn mark_image() -> egui::ColorImage {
+    let icon = image::load_from_memory(include_bytes!("../assets/app-icon.png")).expect("bundled icon").to_rgba8();
+    let pixels = icon
+        .pixels()
+        .map(|p| {
+            let lum = (p[0] as f32 * 0.3 + p[1] as f32 * 0.59 + p[2] as f32 * 0.11) * p[3] as f32 / 255.0;
+            let a = ((lum - 40.0) / 190.0).clamp(0.0, 1.0);
+            Color32::from_white_alpha((a * 255.0) as u8)
+        })
+        .collect();
+    egui::ColorImage { size: [icon.width() as usize, icon.height() as usize], pixels }
+}
+
 fn display_font(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("Barlow Condensed".into()))
+}
+
+/// Small upper-case label with a little tracking (section kickers, field labels).
+fn caption(text: &str) -> RichText {
+    RichText::new(text.to_uppercase()).size(T_CAPTION).extra_letter_spacing(0.9)
+}
+
+fn caption_galley(painter: &egui::Painter, text: &str, size: f32, color: Color32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text.to_uppercase(),
+        0.0,
+        egui::TextFormat { font_id: FontId::proportional(size), extra_letter_spacing: 0.9, color, ..Default::default() },
+    );
+    painter.layout_job(job)
+}
+
+/// Paints a caption anchored at `pos`; returns where it went.
+fn paint_caption(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str, color: Color32) -> Rect {
+    let galley = caption_galley(painter, text, T_CAPTION, color);
+    let rect = align.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
+    rect
 }
 
 fn color_image(image: image::DynamicImage) -> egui::ColorImage {
@@ -138,6 +218,18 @@ struct FooterAction {
     build: bool,
 }
 
+/// The Console's filtered view, kept between frames: only new lines are scanned while the filter stays the same.
+#[derive(Default)]
+struct ConsoleView {
+    source: usize,
+    len: usize,
+    filter: String,
+    problems_only: bool,
+    shown: Vec<usize>,
+    warnings: usize,
+    errors: usize,
+}
+
 struct LauncherApp {
     game_root: PathBuf,
     poller: Poller,
@@ -167,18 +259,25 @@ struct LauncherApp {
     console_filter: String,
     console_problems_only: bool,
     console_on_launch: bool,
+    console_view: ConsoleView,
     settings: GameSettings,
     /// The map's loading screen from the player's extracted files; nothing of the game ships with the launcher.
     art: Option<(egui::TextureHandle, Vec2)>,
-    /// The same picture blurred: the whole window's backdrop (panels are see-through over it).
-    bg_art: Option<(egui::TextureHandle, Vec2)>,
     art_path: Option<PathBuf>,
-    art_rx: Option<Receiver<Option<(egui::ColorImage, egui::ColorImage)>>>,
+    art_rx: Option<Receiver<Option<egui::ColorImage>>>,
+    /// The launcher's own backdrop texture (assets\bg-grunge.png), decoded off the UI thread.
+    backdrop: Option<(egui::TextureHandle, Vec2)>,
+    backdrop_rx: Option<Receiver<egui::ColorImage>>,
+    /// Patch-note days the player opened (the newest one shows its highlights either way).
+    notes_open: HashSet<String>,
     /// Display mode (r5rust.toml `fullscreen`) and the custom-value fields of the quick chips.
     fullscreen: bool,
     custom_res: [i64; 2],
     custom_fps: i64,
+    /// The rail logo: the game's banner (assets\icon.png), unchanged from v0.2.
     logo: egui::TextureHandle,
+    /// The game's gear mark, white on transparent (placeholders when there's no map art).
+    mark: egui::TextureHandle,
     /// `--autoplay`: press Play on the first frame it's possible (for scripted tests).
     autoplay: bool,
     /// Our own maximize (the window rect to restore). Windows' maximize of a borderless window spills 8px past every
@@ -199,6 +298,7 @@ impl LauncherApp {
             color_image(image::load_from_memory(include_bytes!("../assets/icon.png")).expect("bundled icon")),
             egui::TextureOptions::LINEAR,
         );
+        let mark = ctx.load_texture("r5rust-mark", mark_image(), egui::TextureOptions::LINEAR);
         let game_root = game::load_game_root();
         // `--page=notes|console|settings` opens on that page (handy for shortcuts and screenshots).
         let page = match std::env::args().find_map(|a| a.strip_prefix("--page=").map(str::to_owned)).as_deref() {
@@ -207,6 +307,14 @@ impl LauncherApp {
             Some("settings") => Page::Settings,
             _ => Page::Play,
         };
+        let (tx, backdrop_rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            if let Ok(img) = image::load_from_memory(include_bytes!("../assets/bg-grunge.png")) {
+                let _ = tx.send(color_image(img));
+                repaint.request_repaint();
+            }
+        });
         Self {
             poller: Poller::start(game_root.clone(), ctx.clone()),
             settings: GameSettings::load(&game_root),
@@ -232,14 +340,18 @@ impl LauncherApp {
             console_filter: String::new(),
             console_problems_only: false,
             console_on_launch: game::read_flag("console_on_launch.txt"),
+            console_view: ConsoleView::default(),
             art: None,
-            bg_art: None,
             art_path: None,
+            art_rx: None,
+            backdrop: None,
+            backdrop_rx: Some(backdrop_rx),
+            notes_open: HashSet::new(),
             fullscreen: game::read_fullscreen(&game::load_game_root()),
             custom_res: [1920, 1080],
             custom_fps: 200,
-            art_rx: None,
             logo,
+            mark,
             autoplay: std::env::args().any(|a| a == "--autoplay"),
             restore_rect: None,
             start_maximized: std::env::args().any(|a| a == "--maximized"),
@@ -387,6 +499,10 @@ impl LauncherApp {
     }
 
     fn phase(&self, snap: &Snapshot) -> PlayPhase {
+        // `--screenshot=... --idle`: draw the idle state even while a game runs (checking the UI; nothing is launched)
+        if self.screenshot.is_some() && std::env::args().any(|a| a == "--idle") {
+            return PlayPhase::Idle;
+        }
         match &self.play_job {
             Some(job) if job.running() => {
                 if snap.running || game::process_running("r5rust.exe") {
@@ -453,44 +569,33 @@ impl LauncherApp {
 
     /// Loads the map's loading screen off the UI thread whenever the file it points at changes.
     fn sync_art(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        if let Some(rx) = &self.backdrop_rx
+            && let Ok(img) = rx.try_recv()
+        {
+            let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
+            self.backdrop = Some((ctx.load_texture("backdrop", img, egui::TextureOptions::LINEAR), size));
+            self.backdrop_rx = None;
+        }
         if let Some(rx) = &self.art_rx
             && let Ok(image) = rx.try_recv()
         {
-            let (art, bg) = match image {
-                Some((img, blur)) => {
-                    let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
-                    let bsize = Vec2::new(blur.size[0] as f32, blur.size[1] as f32);
-                    (
-                        Some((ctx.load_texture("map-art", img, egui::TextureOptions::LINEAR), size)),
-                        Some((ctx.load_texture("map-art-blur", blur, egui::TextureOptions::LINEAR), bsize)),
-                    )
-                }
-                None => (None, None),
-            };
-            self.art = art;
-            self.bg_art = bg;
+            self.art = image.map(|img| {
+                let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
+                (ctx.load_texture("map-art", img, egui::TextureOptions::LINEAR), size)
+            });
             self.art_rx = None;
         }
         if self.art_rx.is_none() && snap.files.loadscreen != self.art_path {
             self.art_path = snap.files.loadscreen.clone();
             match self.art_path.clone() {
-                None => {
-                    self.art = None;
-                    self.bg_art = None;
-                }
+                None => self.art = None,
                 Some(path) => {
                     let (tx, rx) = mpsc::channel();
                     let ctx = ctx.clone();
                     thread::spawn(move || {
                         let image = image::open(&path).ok().map(|i| {
-                            let i = if i.width() > 2560 {
-                                i.resize(2560, 1440, image::imageops::FilterType::Triangle)
-                            } else {
-                                i
-                            };
-                            // backdrop: blurred small (cheap) and drawn stretched; linear filtering smooths it
-                            let blur = i.resize(480, 270, image::imageops::FilterType::Triangle).blur(9.0);
-                            (color_image(i), color_image(blur))
+                            let i = if i.width() > 2560 { i.resize(2560, 1440, image::imageops::FilterType::Triangle) } else { i };
+                            color_image(i)
                         });
                         let _ = tx.send(image);
                         ctx.request_repaint();
@@ -503,6 +608,17 @@ impl LauncherApp {
 }
 
 impl eframe::App for LauncherApp {
+    /// `--screenshot`: the window takes no input at all, so a mouse that happens to be over it on the live desktop
+    /// can't scroll, hover, select or click anything (and can never press Play).
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.screenshot.is_some() {
+            raw.events.retain(|e| matches!(e, egui::Event::Screenshot { .. }));
+            raw.hovered_files.clear();
+            raw.dropped_files.clear();
+            raw.focused = false;
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs(ctx);
         // `--install-demo`: run install.ps1 -Demo (made-up progress, touches nothing) to check the install view
@@ -514,8 +630,9 @@ impl eframe::App for LauncherApp {
         }
         if let Some(path) = self.screenshot.clone() {
             self.frames += 1;
-            // once the first install check is back (or after ~10 s)
-            if self.frames > 20 && (self.install_status != InstallStatus::Checking || self.frames == 330) && self.frames < 1000 {
+            // once the first install check and the backdrop are in (or after ~10 s)
+            let ready = self.install_status != InstallStatus::Checking && self.backdrop_rx.is_none() && self.art_rx.is_none();
+            if self.frames > 20 && (ready || self.frames == 330) && self.frames < 1000 {
                 self.frames = 1000;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             }
@@ -541,13 +658,7 @@ impl eframe::App for LauncherApp {
             self.check_install(ctx, snap.files.assets_root.clone());
         }
         self.sync_install(&snap);
-        let screen = ctx.screen_rect();
-        let backdrop = ctx.layer_painter(egui::LayerId::background());
-        backdrop.rect_filled(screen, Rounding::same(0.0), BG);
-        if let Some((tex, size)) = &self.bg_art {
-            backdrop.image(tex.id(), screen, cover_uv(*size, screen.size()), Color32::WHITE);
-            backdrop.rect_filled(screen, Rounding::same(0.0), glass(BG, 120));
-        }
+        self.paint_backdrop(ctx);
         let phase = self.phase(&snap);
         let can_play = snap.is_ready() && snap.files.ok() && phase == PlayPhase::Idle && !self.installing();
         let can_build = matches!(snap.state, GameState::Ready | GameState::NoBuild)
@@ -560,8 +671,13 @@ impl eframe::App for LauncherApp {
         self.rail(ctx, &snap, phase);
         egui::TopBottomPanel::bottom("play-footer")
             .exact_height(FOOTER_H)
-            .frame(egui::Frame::none().fill(glass(PANEL, 232)).inner_margin(Margin::symmetric(30.0, 13.0)))
-            .show(ctx, |ui| action = self.footer(ui, &snap, phase, can_play, can_build));
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(glass(PANEL, 240)).inner_margin(Margin::symmetric(GUTTER, 18.0)))
+            .show(ctx, |ui| {
+                let r = ui.max_rect().expand2(Vec2::new(GUTTER, 18.0));
+                ui.painter().hline(r.x_range(), r.top() + 0.5, Stroke::new(1.0_f32, BORDER));
+                action = self.footer(ui, &snap, phase, can_play, can_build);
+            });
 
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(0.0)).show(ctx, |ui| {
             match self.page {
@@ -604,23 +720,169 @@ impl eframe::App for LauncherApp {
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Rail
+// Backdrop: Kainz's grunge texture stretched to cover the window, a vignette, and two faint accent slashes.
+
+impl LauncherApp {
+    fn paint_backdrop(&self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let p = ctx.layer_painter(egui::LayerId::background());
+        p.rect_filled(screen, Rounding::ZERO, BG);
+        if let Some((tex, size)) = &self.backdrop {
+            p.image(tex.id(), screen, cover_uv(*size, screen.size()), Color32::WHITE);
+        }
+        // accent slashes in the top-right corner (behind the page, seen in the gaps between cards)
+        let tr = screen.right_top();
+        paint_slash(&p, tr + Vec2::new(-150.0, 330.0), tr + Vec2::new(150.0, -40.0), 64.0, glass(ACCENT, 30));
+        paint_slash(&p, tr + Vec2::new(-262.0, 330.0), tr + Vec2::new(10.0, -10.0), 14.0, glass(ACCENT, 22));
+        // vignette
+        let edge = 180.0;
+        let dark = Color32::from_black_alpha(110);
+        let clear = Color32::TRANSPARENT;
+        let s = screen;
+        paint_gradient(&p, Rect::from_min_max(s.min, Pos2::new(s.right(), s.top() + edge)), [dark, dark, clear, clear]);
+        paint_gradient(&p, Rect::from_min_max(Pos2::new(s.left(), s.bottom() - edge), s.max), [clear, clear, dark, dark]);
+        paint_gradient(&p, Rect::from_min_max(Pos2::new(s.right() - edge, s.top()), s.max), [clear, dark, dark, clear]);
+    }
+}
+
+/// A straight band from `a` (at `color`) fading out towards `b`.
+fn paint_slash(p: &egui::Painter, a: Pos2, b: Pos2, width: f32, color: Color32) {
+    let dir = (b - a).normalized();
+    let n = Vec2::new(-dir.y, dir.x) * (width / 2.0);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(a + n, color);
+    mesh.colored_vertex(a - n, color);
+    mesh.colored_vertex(b - n, Color32::TRANSPARENT);
+    mesh.colored_vertex(b + n, Color32::TRANSPARENT);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(egui::Shape::mesh(mesh));
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Icons: one line style (1.6 px at 16 px, round-ish joins), drawn on a 16-unit grid centred on `c`.
 
 #[derive(Clone, Copy)]
-enum NavIcon {
+enum Icon {
     Play,
     Notes,
     Console,
     Gear,
+    Calendar,
+    ChevronDown,
+    ChevronUp,
+    ChevronRight,
+    Close,
+    Doc,
+    Folder,
+    Copy,
+    Check,
+    Refresh,
 }
+
+fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
+    let k = size / 16.0;
+    let s = Stroke::new(1.6 * k.max(0.8), color);
+    let v = |x: f32, y: f32| c + Vec2::new(x * k, y * k);
+    let line = |pts: Vec<Pos2>| p.add(egui::Shape::line(pts, s));
+    match icon {
+        Icon::Play => {
+            p.add(egui::Shape::closed_line(vec![v(-4.5, -6.5), v(6.5, 0.0), v(-4.5, 6.5)], s));
+        }
+        Icon::Notes => {
+            for y in [-5.0, 0.0, 5.0] {
+                p.circle_filled(v(-6.0, y), 1.1 * k, color);
+                line(vec![v(-2.5, y), v(7.0, y)]);
+            }
+        }
+        Icon::Console => {
+            p.rect_stroke(Rect::from_min_max(v(-7.0, -6.0), v(7.0, 6.0)), Rounding::same(2.0 * k), s);
+            line(vec![v(-4.0, -2.0), v(-1.5, 0.5), v(-4.0, 3.0)]);
+            line(vec![v(0.5, 3.0), v(4.0, 3.0)]);
+        }
+        Icon::Gear => {
+            let mut pts = Vec::with_capacity(32);
+            for i in 0..8 {
+                let a0 = i as f32 * std::f32::consts::TAU / 8.0;
+                for (da, r) in [(-0.23, 5.0), (-0.14, 7.2), (0.14, 7.2), (0.23, 5.0)] {
+                    let a = a0 + da;
+                    pts.push(v(a.cos() * r, a.sin() * r));
+                }
+            }
+            p.add(egui::Shape::closed_line(pts, s));
+            p.circle_stroke(c, 2.2 * k, s);
+        }
+        Icon::Calendar => {
+            p.rect_stroke(Rect::from_min_max(v(-6.5, -4.5), v(6.5, 6.5)), Rounding::same(1.5 * k), s);
+            line(vec![v(-6.5, -0.5), v(6.5, -0.5)]);
+            line(vec![v(-3.0, -7.0), v(-3.0, -3.0)]);
+            line(vec![v(3.0, -7.0), v(3.0, -3.0)]);
+        }
+        Icon::ChevronDown => {
+            line(vec![v(-4.5, -2.0), v(0.0, 2.5), v(4.5, -2.0)]);
+        }
+        Icon::ChevronUp => {
+            line(vec![v(-4.5, 2.0), v(0.0, -2.5), v(4.5, 2.0)]);
+        }
+        Icon::ChevronRight => {
+            line(vec![v(-2.0, -4.5), v(2.5, 0.0), v(-2.0, 4.5)]);
+        }
+        Icon::Close => {
+            line(vec![v(-5.0, -5.0), v(5.0, 5.0)]);
+            line(vec![v(5.0, -5.0), v(-5.0, 5.0)]);
+        }
+        Icon::Doc => {
+            p.add(egui::Shape::closed_line(vec![v(-5.0, -7.0), v(2.0, -7.0), v(5.5, -3.5), v(5.5, 7.0), v(-5.0, 7.0)], s));
+            line(vec![v(-2.0, 0.0), v(2.5, 0.0)]);
+            line(vec![v(-2.0, 3.5), v(2.5, 3.5)]);
+        }
+        Icon::Folder => {
+            p.add(egui::Shape::closed_line(
+                vec![v(-7.0, -5.0), v(-2.5, -5.0), v(-1.0, -3.0), v(7.0, -3.0), v(7.0, 6.0), v(-7.0, 6.0)],
+                s,
+            ));
+        }
+        Icon::Copy => {
+            p.rect_stroke(Rect::from_min_max(v(-2.5, -2.5), v(6.5, 6.5)), Rounding::same(1.5 * k), s);
+            line(vec![v(-6.5, 2.5), v(-6.5, -6.5), v(2.5, -6.5)]);
+        }
+        Icon::Check => {
+            line(vec![v(-5.5, 0.5), v(-1.5, 4.5), v(5.5, -4.0)]);
+        }
+        Icon::Refresh => {
+            let pts: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = -0.6 + i as f32 / 20.0 * 4.9;
+                    v(a.cos() * 6.0, a.sin() * 6.0)
+                })
+                .collect();
+            let end = *pts.last().unwrap();
+            line(pts);
+            p.add(egui::Shape::line(vec![end + Vec2::new(-3.5, -0.8) * k, end, end + Vec2::new(0.6, -3.6) * k], s));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------------------
+// Rail
 
 impl LauncherApp {
     fn rail(&mut self, ctx: &egui::Context, snap: &Snapshot, phase: PlayPhase) {
         egui::SidePanel::left("launcher-rail")
             .exact_width(RAIL_W)
             .resizable(false)
-            .frame(egui::Frame::none().fill(glass(RAIL, 214)).inner_margin(0.0))
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(glass(RAIL, 222)).inner_margin(0.0))
             .show(ctx, |ui| {
+                let full = ui.max_rect();
+                let p = ui.painter().clone();
+                p.vline(full.right() - 0.5, full.y_range(), Stroke::new(1.0_f32, BORDER));
+                // two faint accent slashes in the rail's empty lower half
+                let bl = Pos2::new(full.left(), full.bottom() - FOOTER_H);
+                paint_slash(&p, bl + Vec2::new(-30.0, 10.0), bl + Vec2::new(230.0, -300.0), 58.0, glass(ACCENT, 34));
+                paint_slash(&p, bl + Vec2::new(70.0, 10.0), bl + Vec2::new(250.0, -200.0), 12.0, glass(ACCENT, 26));
+
+                // brand: the game's banner logo, drawn exactly as in v0.2 (Kainz's call: keep it, don't recolour it)
                 ui.add_space(38.0);
                 ui.horizontal(|ui| {
                     ui.add_space(26.0);
@@ -629,111 +891,78 @@ impl LauncherApp {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.add_space(3.0);
-                        ui.label(RichText::new("R5RUST").font(display_font(28.0)).color(TEXT));
-                        ui.label(RichText::new("LAUNCHER").size(10.0).color(MUTED));
+                        ui.label(RichText::new("R5RUST").font(display_font(28.0)).color(LOGO_TEXT));
+                        ui.label(RichText::new("LAUNCHER").size(10.0).color(LOGO_MUTED));
                     });
                 });
                 ui.add_space(36.0);
-
-                let unbuilt = snap.unbuilt.filter(|n| *n > 0).map(|n| (format!("{n} NEW"), CYAN));
-                let live = (phase != PlayPhase::Idle).then(|| ("LIVE".to_owned(), CYAN));
+                let unbuilt = snap.unbuilt.filter(|n| *n > 0).map(|n| Badge::New(format!("{n} NEW")));
+                let live = (phase != PlayPhase::Idle).then_some(Badge::Live);
                 for (page, label, icon, badge) in [
-                    (Page::Play, "Play", NavIcon::Play, None),
-                    (Page::Notes, "Patch Notes", NavIcon::Notes, unbuilt),
-                    (Page::Console, "Console", NavIcon::Console, live),
-                    (Page::Settings, "Settings", NavIcon::Gear, None),
+                    (Page::Play, "Play", Icon::Play, None),
+                    (Page::Notes, "Patch Notes", Icon::Notes, unbuilt),
+                    (Page::Console, "Console", Icon::Console, live),
+                    (Page::Settings, "Settings", Icon::Gear, None),
                 ] {
                     if nav_item(ui, label, icon, self.page == page, badge) {
                         self.page = page;
                         self.mode_menu_open = false;
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(SP_XS);
                 }
 
                 // The version block sits in a band level with the footer, its top edge on the footer's.
-                let band_top = ui.max_rect().bottom() - FOOTER_H;
-                ui.add_space((band_top - ui.cursor().min.y).max(16.0));
-                ui.painter().hline(ui.max_rect().x_range(), band_top, Stroke::new(1.0_f32, BORDER));
-                ui.add_space((FOOTER_H - 44.0) / 2.0 - 4.0);
+                let band_top = full.bottom() - FOOTER_H;
+                p.rect_filled(Rect::from_min_max(Pos2::new(full.left(), band_top), full.max), Rounding::ZERO, glass(RAIL, 200));
+                p.hline(full.x_range(), band_top + 0.5, Stroke::new(1.0_f32, BORDER));
                 let build = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("none");
-                for (key, value) in [("GAME", build.to_owned()), ("LAUNCHER", format!("v{}", env!("CARGO_PKG_VERSION")))]
-                {
-                    ui.horizontal(|ui| {
-                        ui.add_space(24.0);
-                        ui.label(RichText::new(key).size(10.0).color(MUTED));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(24.0);
-                            ui.label(RichText::new(value).size(12.0).monospace().color(SECONDARY));
-                        });
-                    });
+                let launcher = format!("v{}", env!("CARGO_PKG_VERSION"));
+                for (i, (key, value)) in [("Game", build), ("Launcher", launcher.as_str())].into_iter().enumerate() {
+                    let y = band_top + FOOTER_H / 2.0 + (i as f32 - 0.5) * 24.0;
+                    paint_caption(&p, Pos2::new(full.left() + SP_XL, y), Align2::LEFT_CENTER, key, MUTED);
+                    p.text(Pos2::new(full.right() - SP_XL, y), Align2::RIGHT_CENTER, value, FontId::monospace(T_MONO), SECONDARY);
                 }
             });
     }
 }
 
-fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, active: bool, badge: Option<(String, Color32)>) -> bool {
-    let width = ui.available_width() - 20.0;
+enum Badge {
+    New(String),
+    Live,
+}
+
+fn nav_item(ui: &mut egui::Ui, label: &str, icon: Icon, active: bool, badge: Option<Badge>) -> bool {
     let (slot, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
-    let rect = Rect::from_min_size(slot.min + Vec2::new(10.0, 0.0), Vec2::new(width, 44.0));
-    let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered() || active, 0.12);
-    let painter = ui.painter();
-    // over the see-through rail: nothing behind an idle item, a glass fill on hover, solid when active
-    let fill = if active { glass(RAISED, 235) } else { glass(HOVER, (hover * 200.0) as u8) };
-    painter.rect_filled(rect, Rounding::same(0.0), fill);
+    let rect = slot.shrink2(Vec2::new(SP_M, 0.0));
+    let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered() && !active, 0.12);
+    let p = ui.painter();
     if active {
-        painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), Rounding::same(0.0), CYAN);
-    }
-    let color = if active { CYAN } else { mix(SECONDARY, TEXT, hover) };
-    let c = Pos2::new(rect.left() + 28.0, rect.center().y);
-    let stroke = Stroke::new(1.5_f32, color);
-    match icon {
-        NavIcon::Play => {
-            painter.add(egui::Shape::convex_polygon(
-                vec![Pos2::new(c.x - 4.0, c.y - 6.0), Pos2::new(c.x + 6.0, c.y), Pos2::new(c.x - 4.0, c.y + 6.0)],
-                color,
-                Stroke::NONE,
-            ));
-        }
-        NavIcon::Notes => {
-            for (dy, w) in [(-5.0, 12.0), (0.0, 12.0), (5.0, 8.0)] {
-                painter.line_segment([Pos2::new(c.x - 6.0, c.y + dy), Pos2::new(c.x - 6.0 + w, c.y + dy)], stroke);
-            }
-        }
-        NavIcon::Console => {
-            painter.rect_stroke(Rect::from_center_size(c, Vec2::new(14.0, 11.0)), Rounding::same(0.0), stroke);
-            painter.line_segment([c + Vec2::new(-4.0, -2.0), c + Vec2::new(-1.5, 0.0)], stroke);
-            painter.line_segment([c + Vec2::new(-1.5, 0.0), c + Vec2::new(-4.0, 2.0)], stroke);
-            painter.line_segment([c + Vec2::new(0.5, 2.5), c + Vec2::new(4.0, 2.5)], stroke);
-        }
-        NavIcon::Gear => {
-            painter.circle_stroke(c, 3.2, stroke);
-            for i in 0..8 {
-                let a = i as f32 * std::f32::consts::TAU / 8.0;
-                let d = Vec2::new(a.cos(), a.sin());
-                painter.line_segment([c + d * 5.0, c + d * 7.0], Stroke::new(2.0_f32, color));
-            }
-        }
-    }
-    painter.text(
-        Pos2::new(rect.left() + 48.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(14.0),
-        if active { TEXT } else { mix(SECONDARY, TEXT, hover) },
-    );
-    if let Some((badge, color)) = badge {
-        painter.text(
-            Pos2::new(rect.right() - 12.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            badge,
-            FontId::proportional(10.0),
-            color,
+        p.rect_filled(rect, Rounding::same(R_CTRL), ACCENT_TINT);
+        p.rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+            Rounding { nw: R_CTRL, sw: R_CTRL, ne: 0.0, se: 0.0 },
+            ACCENT,
         );
+    } else if hover > 0.0 {
+        p.rect_filled(rect, Rounding::same(R_CTRL), glass(HOVER, (hover * 150.0) as u8));
+    }
+    let color = if active { TEXT } else { mix(SECONDARY, TEXT, hover) };
+    paint_icon(p, icon, Pos2::new(rect.left() + 26.0, rect.center().y), 16.0, if active { ACCENT_HI } else { color });
+    p.text(Pos2::new(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(T_BODY + 0.5), color);
+    match badge {
+        Some(Badge::New(text)) => {
+            pill(p, Pos2::new(rect.right() - SP_M, rect.center().y), Align2::RIGHT_CENTER, &text, PillStyle::Accent);
+        }
+        Some(Badge::Live) => {
+            let r = paint_caption(p, Pos2::new(rect.right() - SP_M, rect.center().y), Align2::RIGHT_CENTER, "Live", GOOD);
+            p.circle_filled(Pos2::new(r.left() - 8.0, r.center().y), 3.0, GOOD);
+        }
+        None => {}
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-/// `c` at `alpha`: the see-through panels over the blurred map art.
+/// `c` at `alpha`: see-through surfaces over the backdrop.
 fn glass(c: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
@@ -743,83 +972,77 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PillStyle {
+    /// Accent fill, white text (LATEST, N NEW).
+    Accent,
+    /// Status colour fill, dark text (PLAYING).
+    Solid(Color32),
+    /// Hairline outline in a status colour (STAGED, NOT BUILT).
+    Outline(Color32),
+}
+
+/// A small status label in a 20 px pill-ish box (control corners). Returns its rect.
+fn pill(p: &egui::Painter, pos: Pos2, align: Align2, text: &str, style: PillStyle) -> Rect {
+    let (fg, fill, stroke) = match style {
+        PillStyle::Accent => (Color32::WHITE, ACCENT, Stroke::NONE),
+        PillStyle::Solid(c) => (INK, c, Stroke::NONE),
+        PillStyle::Outline(c) => (c, Color32::TRANSPARENT, Stroke::new(1.0_f32, c.gamma_multiply(0.8))),
+    };
+    let galley = caption_galley(p, text, 10.0, fg);
+    let size = Vec2::new(galley.size().x + 14.0, 20.0);
+    let rect = align.anchor_size(pos, size);
+    p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), fill, stroke);
+    p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+    rect
+}
+
+fn ui_pill(ui: &mut egui::Ui, text: &str, style: PillStyle) {
+    let galley = caption_galley(ui.painter(), text, 10.0, TEXT);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(galley.size().x + 14.0, 20.0), Sense::hover());
+    pill(ui.painter(), rect.center(), Align2::CENTER_CENTER, text, style);
+}
+
 // -------------------------------------------------------------------------------------------------------------------
 // Footer: what's installed, what's pending, and the two actions.
 
 impl LauncherApp {
-    fn footer(
-        &self,
-        ui: &mut egui::Ui,
-        snap: &Snapshot,
-        phase: PlayPhase,
-        can_play: bool,
-        can_build: bool,
-    ) -> FooterAction {
+    fn footer(&self, ui: &mut egui::Ui, snap: &Snapshot, phase: PlayPhase, can_play: bool, can_build: bool) -> FooterAction {
         let mut action = FooterAction::default();
-        let left_w = (ui.available_width() - 196.0 - 200.0 - 48.0).max(200.0);
+        let left_w = (ui.available_width() - 200.0 - 200.0 - SP_M - SP_3XL).max(200.0);
         ui.horizontal(|ui| {
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, ui.available_height()), Sense::hover());
+            ui.painter().rect_filled(bar, Rounding::same(1.5), ACCENT);
+            ui.add_space(SP_M);
             ui.allocate_ui_with_layout(Vec2::new(left_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(left_w);
                 ui.spacing_mut().item_spacing.y = 3.0;
                 let title = match snap.state {
-                    GameState::Ready if snap.current.is_some() => "INSTALLED BUILD",
-                    GameState::Ready => "STAGED BUILD",
-                    GameState::NoBuild => "NO BUILD YET",
-                    GameState::FolderMissing | GameState::InvalidFolder => "SETUP REQUIRED",
+                    GameState::Ready if snap.current.is_some() => "Installed build",
+                    GameState::Ready => "Staged build",
+                    GameState::NoBuild => "No build yet",
+                    GameState::FolderMissing | GameState::InvalidFolder => "Setup required",
                 };
-                ui.label(RichText::new(title).size(11.0).color(MUTED));
+                ui.label(caption(title).color(ACCENT_HI));
 
                 let body = |ui: &mut egui::Ui, text: &str| {
-                    ui.add(egui::Label::new(RichText::new(text).size(14.0).color(TEXT)).truncate());
+                    ui.add(egui::Label::new(RichText::new(text).size(T_BODY + 0.5).color(TEXT)).truncate());
                 };
                 match (snap.state, snap.current.as_ref().or(snap.next.as_ref())) {
                     (GameState::Ready, Some(build)) => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&build.hash).monospace().size(14.0).color(CYAN));
+                            ui.label(RichText::new(&build.hash).monospace().size(T_BODY).color(ACCENT_HI));
                             body(ui, &build.subject);
                         });
                     }
                     (GameState::Ready, None) => body(ui, "A build is staged (no version info)."),
                     (GameState::NoBuild, _) => body(ui, "Press Build latest to compile the game."),
                     (GameState::FolderMissing, _) => body(ui, "The game folder doesn't exist. Pick it in Settings."),
-                    (GameState::InvalidFolder, _) => {
-                        body(ui, "That folder has no play.ps1. Pick the r5rust folder in Settings.")
-                    }
+                    (GameState::InvalidFolder, _) => body(ui, "That folder has no play.ps1. Pick the r5rust folder in Settings."),
                 }
 
-                let (line, color) = if let Some((text, tone)) = &self.notice {
-                    let color = match tone {
-                        Tone::Info => MUTED,
-                        Tone::Good => CYAN,
-                        Tone::Bad => RED,
-                    };
-                    (text.clone(), color)
-                } else if phase == PlayPhase::Starting {
-                    ("Starting the game...".to_owned(), CYAN)
-                } else if phase == PlayPhase::Ours {
-                    ("Playing. Press Stop to quit.".to_owned(), CYAN)
-                } else if phase == PlayPhase::Elsewhere {
-                    ("R5Rust is already running (started outside the launcher).".to_owned(), CYAN)
-                } else if let Some(job) = self.install_job.as_ref().filter(|j| j.running()) {
-                    let view = InstallView::parse(&job.marks.lock().unwrap());
-                    match view.current() {
-                        Some((i, s)) => (format!("Installing game files: {} ({}/{}).", s.title, i + 1, view.steps.len()), CYAN),
-                        None => ("Installing game files...".to_owned(), CYAN),
-                    }
-                } else if snap.is_ready() && !snap.files.ok() {
-                    ("Game files missing: press Install on the Play page.".to_owned(), AMBER)
-                } else if matches!(self.install_status, InstallStatus::Stale(_)) {
-                    ("Apex or the installer changed: update the game files in Settings > Game files.".to_owned(), AMBER)
-                } else if let (Some(next), Some(_)) = (&snap.next, &snap.current) {
-                    (format!("Update {} staged. It installs when you press Play.", next.hash), CYAN)
-                } else if let Some(n) = snap.unbuilt.filter(|n| *n > 0) {
-                    (format!("{n} newer commit{} not built yet.", plural(n)), MUTED)
-                } else if let Some(b) = snap.newest() {
-                    (format!("Ready to play. Built {}.", b.date), MUTED)
-                } else {
-                    (String::new(), MUTED)
-                };
-                ui.add(egui::Label::new(RichText::new(line).size(12.0).color(color)).truncate());
+                let (line, color) = self.status_line(snap, phase);
+                ui.add(egui::Label::new(RichText::new(line).size(T_SMALL).color(color)).truncate());
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -831,7 +1054,7 @@ impl LauncherApp {
                 };
                 let response = big_button(ui, label, style, enabled);
                 if phase == PlayPhase::Starting {
-                    paint_progress_line(ui, response.rect, CYAN);
+                    paint_progress_line(ui, response.rect, ACCENT_HI);
                 }
                 if response.clicked() {
                     match phase {
@@ -840,45 +1063,73 @@ impl LauncherApp {
                         PlayPhase::Elsewhere => {}
                     }
                 }
-                ui.add_space(12.0);
+                ui.add_space(SP_M);
                 action.build = self.build_button(ui, snap, can_build);
             });
         });
         action
     }
 
+    /// The footer's one-sentence status, most important first.
+    fn status_line(&self, snap: &Snapshot, phase: PlayPhase) -> (String, Color32) {
+        if let Some((text, tone)) = &self.notice {
+            let color = match tone {
+                Tone::Info => SECONDARY,
+                Tone::Good => GOOD,
+                Tone::Bad => BAD,
+            };
+            (text.clone(), color)
+        } else if phase == PlayPhase::Starting {
+            ("Starting the game...".to_owned(), GOOD)
+        } else if phase == PlayPhase::Ours {
+            ("Playing. Press Stop to quit.".to_owned(), GOOD)
+        } else if phase == PlayPhase::Elsewhere {
+            ("R5Rust is already running (started outside the launcher).".to_owned(), GOOD)
+        } else if let Some(job) = self.install_job.as_ref().filter(|j| j.running()) {
+            let view = InstallView::parse(&job.marks.lock().unwrap());
+            match view.current() {
+                Some((i, s)) => (format!("Installing game files: {} ({}/{}).", s.title, i + 1, view.steps.len()), SECONDARY),
+                None => ("Installing game files...".to_owned(), SECONDARY),
+            }
+        } else if snap.is_ready() && !snap.files.ok() {
+            ("Game files missing: press Install on the Play page.".to_owned(), AMBER)
+        } else if matches!(self.install_status, InstallStatus::Stale(_)) {
+            ("Apex or the installer changed: update the game files in Settings > Game files.".to_owned(), AMBER)
+        } else if let (Some(next), Some(_)) = (&snap.next, &snap.current) {
+            (format!("Update {} staged. It installs when you press Play.", next.hash), GOOD)
+        } else if let Some(n) = snap.unbuilt.filter(|n| *n > 0) {
+            (format!("{n} newer commit{} not built yet.", plural(n)), MUTED)
+        } else if let Some(b) = snap.newest() {
+            (format!("Ready to play. Built {}.", b.date), MUTED)
+        } else {
+            (String::new(), MUTED)
+        }
+    }
+
     fn build_button(&self, ui: &mut egui::Ui, snap: &Snapshot, enabled: bool) -> bool {
         let (rect, response) = ui.allocate_exact_size(Vec2::new(200.0, 56.0), Sense::click());
         let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
         let hover = ui.ctx().animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
-        let painter = ui.painter();
+        let p = ui.painter();
         let pending = snap.unbuilt.is_some_and(|n| n > 0) || snap.state == GameState::NoBuild;
-        painter.rect_filled(rect, Rounding::same(0.0), mix(RAISED, HOVER, hover));
-        if pending && enabled {
-            painter.rect_stroke(rect.shrink(0.5), Rounding::same(0.0), Stroke::new(1.0_f32, CYAN.gamma_multiply(0.6)));
-        }
+        let border = if pending && enabled { ACCENT } else { mix(BORDER, Color32::from_rgb(70, 76, 86), hover) };
+        p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), mix(RAISED, HOVER, hover), Stroke::new(1.0_f32, border));
         let (title, detail, detail_color) = if let Some(job) = self.build_job.as_ref().filter(|j| j.running()) {
-            ("BUILDING", format!("cargo build  {}", fmt_duration(job.elapsed())), CYAN)
+            ("BUILDING", format!("cargo build  {}", fmt_duration(job.elapsed())), SECONDARY)
         } else if snap.state == GameState::NoBuild {
             ("BUILD LATEST", "no build yet".to_owned(), AMBER)
         } else {
             match snap.unbuilt {
                 Some(0) => ("BUILD LATEST", "up to date".to_owned(), MUTED),
-                Some(n) => ("BUILD LATEST", format!("{n} new commit{}", plural(n)), CYAN),
+                Some(n) => ("BUILD LATEST", format!("{n} new commit{}", plural(n)), ACCENT_HI),
                 None => ("BUILD LATEST", "compile + stage".to_owned(), MUTED),
             }
         };
         let title_color = if enabled || self.building() { TEXT } else { MUTED };
-        painter.text(rect.left_top() + Vec2::new(16.0, 12.0), Align2::LEFT_TOP, title, display_font(18.0), title_color);
-        painter.text(
-            rect.left_top() + Vec2::new(16.0, 34.0),
-            Align2::LEFT_TOP,
-            detail,
-            FontId::proportional(11.0),
-            detail_color,
-        );
+        p.text(rect.left_top() + Vec2::new(SP_L, 10.0), Align2::LEFT_TOP, title, display_font(T_TITLE + 2.0), title_color);
+        p.text(rect.left_top() + Vec2::new(SP_L, 34.0), Align2::LEFT_TOP, detail, FontId::proportional(11.5), detail_color);
         if self.building() {
-            paint_progress_line(ui, rect, CYAN);
+            paint_progress_line(ui, rect, ACCENT_HI);
         }
         enabled && response.clicked()
     }
@@ -891,19 +1142,19 @@ enum BigStyle {
     Off,
 }
 
-/// The one loud thing on screen: 196x56, hover fades in, the press darkens.
+/// The one loud thing on screen: 200x56, hover brightens, the press darkens.
 fn big_button(ui: &mut egui::Ui, label: &str, style: BigStyle, enabled: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(196.0, 56.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(200.0, 56.0), Sense::click());
     let hover = ui.ctx().animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
     let pressed = enabled && response.is_pointer_button_down_on();
-    let (fill, text) = match style {
-        BigStyle::Primary => (mix(CYAN, CYAN_HI, hover), INK),
-        BigStyle::Stop => (mix(RAISED, Color32::from_rgb(120, 40, 36), hover), mix(TEXT, Color32::WHITE, hover)),
-        BigStyle::Off => (RAISED, MUTED),
+    let (fill, stroke, text) = match style {
+        BigStyle::Primary => (mix(ACCENT, ACCENT_HI, hover), Stroke::NONE, Color32::WHITE),
+        BigStyle::Stop => (mix(RAISED, ACCENT_TINT, hover), Stroke::new(1.0_f32, ACCENT), TEXT),
+        BigStyle::Off => (RAISED, Stroke::new(1.0_f32, BORDER), MUTED),
     };
     let fill = if pressed { fill.gamma_multiply(0.85) } else { fill };
-    ui.painter().rect_filled(rect, Rounding::same(0.0), fill);
-    ui.painter().text(rect.center() + Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, label, display_font(27.0), text);
+    ui.painter().rect(rect.shrink(0.5), Rounding::same(R_CTRL), fill, stroke);
+    ui.painter().text(rect.center() + Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, label, display_font(30.0), text);
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else if label == "RUNNING" {
@@ -922,7 +1173,7 @@ fn paint_progress_line(ui: &egui::Ui, rect: Rect, color: Color32) {
         Pos2::new(x.max(rect.left()), rect.bottom() - 2.0),
         Pos2::new((x + span).min(rect.right()), rect.bottom()),
     );
-    ui.painter().rect_filled(bar, Rounding::same(0.0), color);
+    ui.painter().rect_filled(bar, Rounding::ZERO, color);
     ui.ctx().request_repaint_after(Duration::from_millis(16));
 }
 
@@ -939,93 +1190,99 @@ fn plural(n: u32) -> &'static str {
 // Play page
 
 impl LauncherApp {
-    fn paint_hero_background(&self, painter: &egui::Painter, hero: Rect) {
-        if let Some((tex, size)) = &self.art {
-            painter.image(tex.id(), hero, cover_uv(*size, hero.size()), Color32::WHITE);
-            return;
+    /// The map art (or a plain placeholder: the launcher ships no game imagery) filling `rect`.
+    fn paint_art(&self, ui: &egui::Ui, rect: Rect, rounding: f32) {
+        match &self.art {
+            Some((tex, size)) => {
+                egui::Image::new((tex.id(), *size)).uv(cover_uv(*size, rect.size())).rounding(rounding).paint_at(ui, rect);
+            }
+            None => {
+                let p = ui.painter();
+                p.rect_filled(rect, Rounding::same(rounding), RAISED);
+                let clip = p.with_clip_rect(rect);
+                let w = rect.width();
+                paint_slash(&clip, rect.left_bottom() + Vec2::new(w * 0.05, 0.0), rect.right_top() - Vec2::new(w * 0.2, 0.0), w * 0.12, glass(ACCENT, 26));
+                let m = rect.height().min(rect.width()) * 0.34;
+                clip.image(
+                    self.mark.id(),
+                    Rect::from_center_size(rect.center(), Vec2::splat(m)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::from_white_alpha(28),
+                );
+            }
         }
-        // No extracted art: a plain dark field (the launcher ships no game imagery).
-        paint_scrim_colors(painter, hero, [PANEL, Color32::from_rgb(16, 30, 40), BG, BG]);
     }
 
     /// Returns true when the files card asked to change the game folder.
     fn play_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &Snapshot, phase: PlayPhase) -> bool {
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
-        let bar_h = 56.0;
-        let hero = Rect::from_min_max(full.min + Vec2::new(28.0, 48.0), Pos2::new(full.right() - 28.0, full.bottom() - bar_h - 28.0));
-        let bar = Rect::from_min_max(Pos2::new(hero.left(), hero.bottom() + 14.0), Pos2::new(hero.right(), hero.bottom() + 14.0 + bar_h));
+        let chips_h = 44.0;
+        let hero = Rect::from_min_max(
+            full.min + Vec2::new(GUTTER, PAGE_TOP),
+            Pos2::new(full.right() - GUTTER, full.bottom() - SP_XL - chips_h - SP_L),
+        );
+        let bar = Rect::from_min_size(Pos2::new(hero.left(), hero.bottom() + SP_L), Vec2::new(hero.width(), chips_h));
         let painter = ui.painter().clone();
-        self.paint_hero_background(&painter, hero);
-        paint_vertical_scrim(
-            &painter,
-            Rect::from_min_max(hero.min, Pos2::new(hero.right(), hero.top() + hero.height() * 0.25)),
-            96,
-            0,
-        );
-        paint_vertical_scrim(
-            &painter,
-            Rect::from_min_max(Pos2::new(hero.left(), hero.top() + hero.height() * 0.5), hero.max),
-            0,
-            196,
-        );
-        paint_horizontal_scrim(
-            &painter,
-            Rect::from_min_max(hero.min, Pos2::new(hero.left() + hero.width() * 0.5, hero.bottom())),
-            84,
-            0,
-        );
-        painter.rect_stroke(hero, Rounding::same(0.0), Stroke::new(1.0_f32, glass(Color32::WHITE, 26)));
+        self.paint_art(ui, hero, R_CARD);
+        // scrims: a light one under the MODES tab, a heavy one under the title, and a left one for the text column
+        let shade = |a: u8| Color32::from_rgba_unmultiplied(6, 7, 9, a);
+        let clip = painter.with_clip_rect(hero.shrink(1.0));
+        let top = Rect::from_min_max(hero.min, Pos2::new(hero.right(), hero.top() + hero.height() * 0.3));
+        paint_gradient(&clip, top, [shade(120), shade(120), shade(0), shade(0)]);
+        let low = Rect::from_min_max(Pos2::new(hero.left(), hero.top() + hero.height() * 0.42), hero.max);
+        paint_gradient(&clip, low, [shade(0), shade(0), shade(225), shade(225)]);
+        let left = Rect::from_min_max(hero.min, Pos2::new(hero.left() + hero.width() * 0.6, hero.bottom()));
+        paint_gradient(&clip, left, [shade(130), shade(0), shade(0), shade(130)]);
+        painter.rect_stroke(hero, Rounding::same(R_CARD), Stroke::new(1.0_f32, glass(Color32::WHITE, 22)));
         self.quick_bar(ui, bar, phase == PlayPhase::Idle);
 
         // MODES tab
-        let tab = Rect::from_min_size(Pos2::new(hero.left() + 32.0, hero.top() + 22.0), Vec2::new(132.0, 38.0));
+        let tab = Rect::from_min_size(Pos2::new(hero.left() + SP_2XL, hero.top() + SP_XL), Vec2::new(112.0, 38.0));
         let tab_response = ui.interact(tab, egui::Id::new("mode-tab"), Sense::click());
         let tab_color = if tab_response.hovered() || self.mode_menu_open { TEXT } else { SECONDARY };
-        painter.text(Pos2::new(tab.left(), tab.top() + 8.0), Align2::LEFT_TOP, "MODES", display_font(18.0), tab_color);
-        let arrow = Pos2::new(tab.left() + 60.0, tab.top() + 19.0);
-        let flip = if self.mode_menu_open { -1.0 } else { 1.0 };
-        painter.line_segment([Pos2::new(arrow.x - 4.0, arrow.y - 2.0 * flip), arrow], Stroke::new(1.3_f32, tab_color));
-        painter.line_segment([arrow, Pos2::new(arrow.x + 4.0, arrow.y - 2.0 * flip)], Stroke::new(1.3_f32, tab_color));
+        let label = painter.text(Pos2::new(tab.left(), tab.top() + 4.0), Align2::LEFT_TOP, "MODES", display_font(24.0), tab_color);
+        let chevron = if self.mode_menu_open { Icon::ChevronUp } else { Icon::ChevronDown };
+        paint_icon(&painter, chevron, Pos2::new(label.right() + 14.0, label.center().y + 1.0), 14.0, tab_color);
         painter.rect_filled(
-            Rect::from_min_size(Pos2::new(tab.left(), tab.bottom() - 2.0), Vec2::new(72.0, 2.0)),
-            Rounding::same(0.0),
-            CYAN,
+            Rect::from_min_size(Pos2::new(tab.left(), label.bottom() + 5.0), Vec2::new(label.width() + 24.0, 3.0)),
+            Rounding::same(1.5),
+            ACCENT,
         );
         let toggled = tab_response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
         if toggled {
             self.mode_menu_open = !self.mode_menu_open;
         }
 
-        // Title block
-        let x = hero.left() + 34.0;
-        let y = hero.bottom() - 160.0;
-        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, "TRAINING MODE", FontId::proportional(12.0), CYAN);
-        painter.text(Pos2::new(x - 2.0, y + 14.0), Align2::LEFT_TOP, "FIRING RANGE", display_font(70.0), TEXT);
-        painter.text(
-            Pos2::new(x + 2.0, y + 92.0),
-            Align2::LEFT_TOP,
-            "Move freely. Practice your movement. Make the range yours.",
-            FontId::proportional(14.0),
-            SECONDARY,
-        );
+        // Title block, built up from the bottom edge
+        let x = hero.left() + SP_2XL + 2.0;
+        let meta_y = hero.bottom() - SP_2XL;
         let meta = painter.text(
-            Pos2::new(x + 2.0, y + 118.0),
-            Align2::LEFT_TOP,
+            Pos2::new(x, meta_y),
+            Align2::LEFT_BOTTOM,
             format!("LOCAL SESSION   /   SOLO   /   {}", snap.files.map),
-            FontId::monospace(10.0),
+            FontId::monospace(11.5),
             MUTED,
         );
+        let tagline = painter.text(
+            Pos2::new(x, meta.top() - SP_M),
+            Align2::LEFT_BOTTOM,
+            "Move freely. Practice your movement. Make the range yours.",
+            FontId::proportional(15.5),
+            SECONDARY,
+        );
+        let title = painter.text(Pos2::new(x - 3.0, tagline.top() + 8.0), Align2::LEFT_BOTTOM, "FIRING RANGE", display_font(T_HERO), TEXT);
+        paint_caption(&painter, Pos2::new(x, title.top() + 12.0), Align2::LEFT_BOTTOM, "Training mode", ACCENT_HI);
         if phase != PlayPhase::Idle {
             let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) as f32 * 3.0).sin().abs();
-            let dot = Pos2::new(meta.right() + 22.0, meta.center().y);
-            painter.circle_filled(dot, 3.5, CYAN.gamma_multiply(pulse));
+            let dot = Pos2::new(meta.right() + 24.0, meta.center().y);
+            painter.circle_filled(dot, 3.5, GOOD.gamma_multiply(pulse));
             let text = match (phase, self.play_job.as_ref()) {
                 (PlayPhase::Starting, _) => "STARTING".to_owned(),
                 (_, Some(job)) => format!("IN GAME  {}", fmt_duration(job.elapsed())),
                 _ => "IN GAME".to_owned(),
             };
-            painter.text(dot + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, text, FontId::monospace(10.0), CYAN);
+            painter.text(dot + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, text, FontId::monospace(11.5), GOOD);
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
@@ -1034,23 +1291,27 @@ impl LauncherApp {
         let browse = false;
         let show = phase == PlayPhase::Idle && (self.install_job.is_some() || self.install_open || (snap.is_ready() && !snap.files.ok()));
         if show {
-            let card = Rect::from_center_size(hero.center() - Vec2::new(0.0, 30.0), Vec2::new(620.0, 372.0));
+            painter.rect_filled(hero, Rounding::same(R_CARD), shade(120));
+            // centred on the art, using last frame's height (the card grows while installing)
+            let h_id = egui::Id::new("install-card-height");
+            let h: f32 = ctx.data(|d| d.get_temp(h_id)).unwrap_or(400.0);
+            let top = (hero.center().y - h / 2.0).max(hero.top() + SP_XL);
+            let card = Rect::from_min_size(Pos2::new(hero.center().x - 320.0, top), Vec2::new(640.0, hero.bottom() - top));
             ui.allocate_ui_at_rect(card, |ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(12, 17, 24, 240))
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(Margin::same(26.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card.width() - 52.0);
-                        self.install_card(ui, ctx, snap);
-                    });
+                let frame = card_frame(248).inner_margin(Margin::same(28.0));
+                let r = frame.show(ui, |ui| {
+                    ui.set_width(card.width() - 56.0);
+                    self.install_card(ui, ctx, snap);
+                });
+                accent_edge(ui.painter(), r.response.rect);
+                ctx.data_mut(|d| d.insert_temp(h_id, r.response.rect.height()));
             });
         }
 
         if self.mode_menu_open {
             let area = egui::Area::new(egui::Id::new("mode-menu"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(tab.left(), tab.bottom() + 10.0))
+                .fixed_pos(Pos2::new(tab.left(), tab.bottom() + SP_M))
                 .show(ctx, |ui| self.mode_menu(ui));
             if area.inner || (!toggled && area.response.clicked_elsewhere()) {
                 self.mode_menu_open = false;
@@ -1062,22 +1323,17 @@ impl LauncherApp {
     /// Resolution / display / FPS limit / launch options, one chip each, under the map card. They write the same
     /// settings as the Settings page (r5rust_settings.toml [graphics], r5rust.toml, launch_args.txt).
     fn quick_bar(&mut self, ui: &mut egui::Ui, bar: Rect, editable: bool) {
-        let painter = ui.painter().clone();
-        painter.rect_filled(bar, Rounding::same(0.0), glass(PANEL, 222));
-        painter.rect_stroke(bar, Rounding::same(0.0), Stroke::new(1.0_f32, glass(Color32::WHITE, 18)));
-        let inner = bar.shrink2(Vec2::new(10.0, 8.0));
         let mut err = None;
-        ui.allocate_ui_at_rect(inner, |ui| {
+        ui.allocate_ui_at_rect(bar, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = SP_S;
                 let g = self.settings.graphics.clone();
 
                 // Resolution (Apex-style stretched res)
                 let res = if g.stretch[0] > 0 { format!("{} x {}", g.stretch[0], g.stretch[1]) } else { "Native".to_owned() };
                 let mut pick_res: Option<[i64; 2]> = None;
-                quick_chip(ui, "RESOLUTION", &res, editable, |ui| {
-                    ui.label(RichText::new("Stretched resolution: the game renders at this size, stretched to the window (like Apex).").size(11.5).color(MUTED));
-                    ui.add_space(4.0);
+                quick_chip(ui, "Resolution", &res, editable, |ui| {
+                    menu_hint(ui, "Stretched resolution: the game renders at this size, stretched to the window (like Apex).");
                     for (v, label) in [
                         ([0, 0], "Native (window size)"),
                         ([1920, 1080], "1920 x 1080"),
@@ -1093,13 +1349,13 @@ impl LauncherApp {
                             pick_res = Some(v);
                         }
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(SP_S);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Custom").size(12.0).color(SECONDARY));
+                        ui.label(caption("Custom").color(MUTED));
                         ui.add(egui::DragValue::new(&mut self.custom_res[0]).range(320..=7680).speed(4.0));
-                        ui.label(RichText::new("x").size(12.0).color(MUTED));
+                        ui.label(RichText::new("x").size(T_SMALL).color(MUTED));
                         ui.add(egui::DragValue::new(&mut self.custom_res[1]).range(240..=4320).speed(4.0));
-                        if flat_button(ui, "APPLY") {
+                        if ghost_button(ui, "Apply", None) {
                             pick_res = Some(self.custom_res);
                         }
                     });
@@ -1112,14 +1368,14 @@ impl LauncherApp {
 
                 // Display mode
                 let mut pick_fs: Option<bool> = None;
-                quick_chip(ui, "DISPLAY", if self.fullscreen { "Fullscreen" } else { "Windowed" }, editable, |ui| {
+                quick_chip(ui, "Display", if self.fullscreen { "Fullscreen" } else { "Windowed" }, editable, |ui| {
                     if menu_row(ui, "Fullscreen (borderless)", self.fullscreen) {
                         pick_fs = Some(true);
                     }
                     if menu_row(ui, "Windowed", !self.fullscreen) {
                         pick_fs = Some(false);
                     }
-                    ui.label(RichText::new("F11 switches in game.").size(11.5).color(MUTED));
+                    menu_hint(ui, "F11 switches in game.");
                 });
                 if let Some(on) = pick_fs {
                     match game::write_fullscreen(&self.game_root, on) {
@@ -1132,17 +1388,17 @@ impl LauncherApp {
                 // FPS limit
                 let fps = if g.fps_cap > 0 { format!("{} FPS", g.fps_cap) } else { "Unlimited".to_owned() };
                 let mut pick_fps: Option<i64> = None;
-                quick_chip(ui, "FPS LIMIT", &fps, editable, |ui| {
+                quick_chip(ui, "FPS limit", &fps, editable, |ui| {
                     for (v, label) in [(0, "Unlimited"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")] {
                         if menu_row(ui, label, g.fps_cap == v) {
                             pick_fps = Some(v);
                         }
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(SP_S);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Custom").size(12.0).color(SECONDARY));
+                        ui.label(caption("Custom").color(MUTED));
                         ui.add(egui::DragValue::new(&mut self.custom_fps).range(30..=1000).speed(1.0));
-                        if flat_button(ui, "APPLY") {
+                        if ghost_button(ui, "Apply", None) {
                             pick_fps = Some(self.custom_fps);
                         }
                     });
@@ -1163,14 +1419,15 @@ impl LauncherApp {
                 let on = FLAGS.iter().filter(|(f, ..)| game::has_launch_flag(&self.launch_args, f[0])).count();
                 let value = if on == 0 { "Default".to_owned() } else { format!("{on} on") };
                 let mut args = self.launch_args.clone();
-                quick_chip(ui, "LAUNCH", &value, true, |ui| {
+                quick_chip(ui, "Launch", &value, true, |ui| {
+                    ui.add_space(SP_XS);
                     for (flag, title, hint) in FLAGS {
                         let mut v = game::has_launch_flag(&args, flag[0]);
                         if toggle_row(ui, &mut v, title, hint, true) {
                             args = game::set_launch_flag(&args, flag, v);
                         }
                     }
-                    ui.label(RichText::new("More in Settings > Launch options.").size(11.5).color(MUTED));
+                    menu_hint(ui, "More in Settings > Launch options.");
                 });
                 if args != self.launch_args {
                     self.launch_args = args;
@@ -1181,7 +1438,7 @@ impl LauncherApp {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let note = if editable { "Applies the next time the game starts" } else { "Close the game to change these" };
-                    ui.label(RichText::new(note).size(11.5).color(if editable { MUTED } else { AMBER }));
+                    ui.label(RichText::new(note).size(T_SMALL).color(if editable { MUTED } else { AMBER }));
                 });
             });
         });
@@ -1198,15 +1455,15 @@ impl LauncherApp {
             return;
         }
         let (kicker, kicker_color, title) = match &self.install_status {
-            InstallStatus::Stale(_) => ("UPDATE AVAILABLE", AMBER, "Update the game files from your Apex install"),
-            InstallStatus::Partial(_) => ("INSTALL NOT FINISHED", AMBER, "Finish building the game files"),
-            _ if snap.files.ok() => ("REINSTALL", CYAN, "Rebuild the game files from your Apex install"),
-            _ => ("GAME FILES MISSING", AMBER, "Build the Firing Range from your Apex install"),
+            InstallStatus::Stale(_) => ("Update available", AMBER, "Update the game files from your Apex install"),
+            InstallStatus::Partial(_) => ("Install not finished", AMBER, "Finish building the game files"),
+            _ if snap.files.ok() => ("Reinstall", ACCENT_HI, "Rebuild the game files from your Apex install"),
+            _ => ("Game files missing", AMBER, "Build the Firing Range from your Apex install"),
         };
-        ui.label(RichText::new(kicker).size(11.0).color(kicker_color));
-        ui.add_space(2.0);
-        ui.label(RichText::new(title).size(19.0).color(TEXT));
-        ui.add_space(4.0);
+        ui.label(caption(kicker).color(kicker_color));
+        ui.add_space(SP_XS);
+        ui.label(RichText::new(title).size(T_TITLE + 2.0).color(TEXT));
+        ui.add_space(SP_XS);
         let why = match &self.install_status {
             InstallStatus::Stale(d) | InstallStatus::Partial(d) => format!("{d}. "),
             _ => String::new(),
@@ -1215,10 +1472,10 @@ impl LauncherApp {
             RichText::new(format!(
                 "{why}R5Rust ships no game files: it makes them from your own copy of Apex, reading its files only (never the running game). Takes about 15 minutes and 5 GB."
             ))
-            .size(13.5)
+            .size(T_BODY)
             .color(SECONDARY),
         );
-        ui.add_space(14.0);
+        ui.add_space(SP_L);
 
         let mut pick_apex = false;
         let mut pick_dir = false;
@@ -1229,9 +1486,9 @@ impl LauncherApp {
             (true, true) => "Looking for Apex...".to_owned(),
             (true, false) => "Not found: choose the Apex folder".to_owned(),
         };
-        path_row(ui, "APEX", &apex_text, apex_ok || (checking && self.apex_dir.is_empty()), &mut pick_apex);
-        path_row(ui, "SAVE TO", &self.install_dir, true, &mut pick_dir);
-        ui.add_space(8.0);
+        path_row(ui, "Apex", &apex_text, apex_ok || (checking && self.apex_dir.is_empty()), &mut pick_apex);
+        path_row(ui, "Save to", &self.install_dir, true, &mut pick_dir);
+        ui.add_space(SP_S);
         toggle_row(
             ui,
             &mut self.apex_closed,
@@ -1239,16 +1496,18 @@ impl LauncherApp {
             "R5Rust never looks at the running game (anti-cheat), so it can't check: close Apex first.",
             true,
         );
-        ui.add_space(10.0);
+        ui.add_space(SP_M);
         let can = apex_ok && self.apex_closed && !self.install_dir.trim().is_empty() && !self.building();
         let mut start = false;
         let mut close = false;
         ui.horizontal(|ui| {
             let r = big_button(ui, "INSTALL", if can { BigStyle::Primary } else { BigStyle::Off }, can);
             start = r.clicked() && can;
-            ui.add_space(10.0);
+            ui.add_space(SP_M);
             if self.install_open && snap.files.ok() {
-                close = flat_button(ui, "CANCEL");
+                ui.allocate_ui_with_layout(Vec2::new(120.0, 56.0), Layout::left_to_right(Align::Center), |ui| {
+                    close = ghost_button(ui, "Cancel", None);
+                });
             }
         });
         if pick_apex && let Some(d) = Self::pick_folder("Choose the Apex Legends folder (the one with paks\\Win64)", &self.apex_dir) {
@@ -1278,73 +1537,98 @@ impl LauncherApp {
     ) {
         let failed = !running && !view.done.as_ref().is_some_and(|d| d.0);
         let (kicker, color) = if running {
-            (format!("INSTALLING  {}", fmt_duration(elapsed)), CYAN)
+            (format!("Installing  {}", fmt_duration(elapsed)), ACCENT_HI)
         } else if failed {
-            ("INSTALL FAILED".to_owned(), RED)
+            ("Install failed".to_owned(), BAD)
         } else {
-            ("INSTALLED".to_owned(), CYAN)
+            ("Installed".to_owned(), GOOD)
         };
-        ui.label(RichText::new(kicker).size(11.0).color(color));
-        ui.add_space(2.0);
+        ui.label(caption(&kicker).color(color));
+        ui.add_space(SP_XS);
         let title = match (view.current(), &view.done) {
             (Some((_, s)), _) => s.title.clone(),
             (None, Some((_, m))) => m.clone(),
             _ => "Starting...".to_owned(),
         };
-        ui.add(egui::Label::new(RichText::new(title).size(19.0).color(TEXT)).truncate());
-        ui.add_space(8.0);
+        ui.add(egui::Label::new(RichText::new(title).size(T_TITLE + 2.0).color(TEXT)).truncate());
+        ui.add_space(SP_M);
 
         // progress bar (weighted by how long each step takes)
-        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
-        ui.painter().rect_filled(bar, Rounding::same(0.0), RAISED);
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+        ui.painter().rect_filled(bar, Rounding::same(3.0), RAISED);
         let f = view.fraction().clamp(0.0, 1.0);
-        ui.painter().rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * f, bar.height())), Rounding::same(0.0), if failed { RED } else { CYAN });
-        ui.add_space(10.0);
+        if f > 0.0 {
+            let fill = Rect::from_min_size(bar.min, Vec2::new((bar.width() * f).max(6.0), bar.height()));
+            ui.painter().rect_filled(fill, Rounding::same(3.0), if failed { BAD } else { ACCENT });
+        }
+        ui.add_space(SP_L);
 
         // the steps, two columns
         let rows = view.steps.len().div_ceil(2);
-        let col_w = (ui.available_width() - 16.0) / 2.0;
-        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows as f32 * 19.0), Sense::hover());
+        let row_h = 24.0;
+        let col_gap = SP_XL;
+        let col_w = (ui.available_width() - col_gap) / 2.0;
+        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows as f32 * row_h), Sense::hover());
         let p = ui.painter();
         let t = ui.input(|i| i.time) as f32;
         for (i, step) in view.steps.iter().enumerate() {
-            let at = area.min + Vec2::new((i / rows) as f32 * (col_w + 16.0), (i % rows) as f32 * 19.0);
-            let dot = Rect::from_center_size(at + Vec2::new(4.0, 8.0), Vec2::splat(7.0));
-            let (dot_color, right, text_color) = match &step.state {
-                StepState::Pending => (BORDER, String::new(), MUTED),
-                StepState::Running => (CYAN.gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs()), "working".to_owned(), TEXT),
-                StepState::Done(secs) => (CYAN, format!("{secs}s"), SECONDARY),
-                StepState::Skipped(_) => (AMBER, "skipped".to_owned(), SECONDARY),
-                StepState::Failed(_) => (RED, "failed".to_owned(), RED),
+            let at = area.min + Vec2::new((i / rows) as f32 * (col_w + col_gap), (i % rows) as f32 * row_h);
+            let ic = at + Vec2::new(7.0, row_h / 2.0);
+            let (right, text_color) = match &step.state {
+                StepState::Pending => {
+                    p.circle_stroke(ic, 4.5, Stroke::new(1.4_f32, BORDER));
+                    (String::new(), MUTED)
+                }
+                StepState::Running => {
+                    p.circle_filled(ic, 4.5, ACCENT_HI.gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs()));
+                    ("working".to_owned(), TEXT)
+                }
+                StepState::Done(secs) => {
+                    paint_icon(p, Icon::Check, ic, 13.0, GOOD);
+                    (format!("{secs}s"), SECONDARY)
+                }
+                StepState::Skipped(_) => {
+                    p.circle_stroke(ic, 4.5, Stroke::new(1.4_f32, AMBER));
+                    ("skipped".to_owned(), SECONDARY)
+                }
+                StepState::Failed(_) => {
+                    paint_icon(p, Icon::Close, ic, 12.0, BAD);
+                    ("failed".to_owned(), BAD)
+                }
             };
-            p.rect_filled(dot, Rounding::same(0.0), dot_color);
-            p.text(at + Vec2::new(16.0, 1.0), Align2::LEFT_TOP, &step.title, FontId::proportional(13.0), text_color);
-            p.text(at + Vec2::new(col_w, 1.0), Align2::RIGHT_TOP, right, FontId::monospace(10.0), MUTED);
+            p.text(at + Vec2::new(22.0, row_h / 2.0), Align2::LEFT_CENTER, &step.title, FontId::proportional(13.5), text_color);
+            p.text(at + Vec2::new(col_w, row_h / 2.0), Align2::RIGHT_CENTER, right, FontId::monospace(11.0), MUTED);
         }
-        ui.add_space(8.0);
+        ui.add_space(SP_S);
         for tool in &view.missing_tools {
-            ui.label(RichText::new(format!("Missing {tool}")).size(12.0).color(AMBER));
+            ui.label(RichText::new(format!("Missing {tool}")).size(T_SMALL).color(AMBER));
         }
         if let Some(why) = view.steps.iter().find_map(|s| if let StepState::Skipped(w) = &s.state { Some(w) } else { None }) {
-            ui.label(RichText::new(format!("Skipped: {why}")).size(12.0).color(AMBER));
+            ui.label(RichText::new(format!("Skipped: {why}")).size(T_SMALL).color(AMBER));
         }
-        for line in tail {
-            if !line.starts_with("@@") {
-                ui.add(egui::Label::new(RichText::new(line.trim()).monospace().size(11.5).color(MUTED)).truncate());
-            }
+        let shown: Vec<&String> = tail.iter().filter(|l| !l.starts_with("@@")).collect();
+        if !shown.is_empty() {
+            ui.add_space(SP_XS);
+            egui::Frame::none().fill(glass(BG, 230)).rounding(Rounding::same(R_CTRL)).inner_margin(Margin::symmetric(SP_M, SP_S)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for line in shown {
+                    ui.add(egui::Label::new(RichText::new(line.trim()).monospace().size(11.5).color(MUTED)).truncate());
+                }
+            });
         }
-        ui.add_space(10.0);
+        ui.add_space(SP_L);
         let (mut stop, mut retry, mut close, mut open_log) = (false, false, false, false);
         ui.horizontal(|ui| {
             if running {
-                stop = flat_button(ui, "STOP");
+                stop = ghost_button(ui, "Stop", Some(Icon::Close));
             } else {
                 if failed {
-                    retry = flat_button(ui, "TRY AGAIN");
+                    retry = ghost_button(ui, "Try again", Some(Icon::Refresh));
                 }
-                close = flat_button(ui, "CLOSE");
+                close = ghost_button(ui, "Close", None);
             }
-            open_log = flat_button(ui, "OPEN LOG");
+            open_log = ghost_button(ui, "Open log", Some(Icon::Doc));
         });
         if running {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1366,35 +1650,30 @@ impl LauncherApp {
     /// Returns true when the menu should close (a mode was picked).
     fn mode_menu(&self, ui: &mut egui::Ui) -> bool {
         let mut picked = false;
-        egui::Frame::none().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).inner_margin(12.0).show(ui, |ui| {
-            ui.set_width(312.0);
-            ui.label(RichText::new("GAME MODES").size(11.0).color(MUTED));
-            ui.add_space(8.0);
-            let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 74.0), Sense::click());
+        card_frame(250).inner_margin(Margin::same(SP_L)).show(ui, |ui| {
+            ui.set_width(320.0);
+            ui.label(caption("Game modes").color(MUTED));
+            ui.add_space(SP_XS);
+            let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 76.0), Sense::click());
             let p = ui.painter();
-            p.rect_filled(row, Rounding::same(0.0), if response.hovered() { HOVER } else { RAISED });
-            p.rect_filled(Rect::from_min_size(row.left_top(), Vec2::new(2.0, row.height())), Rounding::same(0.0), CYAN);
-            let thumb = Rect::from_min_size(row.left_top() + Vec2::new(10.0, 9.0), Vec2::new(88.0, 56.0));
-            match &self.art {
-                Some((tex, size)) => {
-                    p.image(tex.id(), thumb, cover_uv(*size, thumb.size()), Color32::WHITE);
-                }
-                None => {
-                    p.rect_filled(thumb, Rounding::same(0.0), BG);
-                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                    let mark = Rect::from_center_size(thumb.center(), Vec2::splat(34.0));
-                    p.image(self.logo.id(), mark, uv, Color32::from_white_alpha(90));
-                }
-            }
-            let text_x = thumb.right() + 12.0;
-            p.text(Pos2::new(text_x, row.top() + 22.0), Align2::LEFT_TOP, "Firing Range", FontId::proportional(14.0), TEXT);
-            p.text(Pos2::new(text_x, row.top() + 45.0), Align2::LEFT_TOP, "SELECTED", FontId::proportional(10.0), CYAN);
+            p.rect_filled(row, Rounding::same(R_CTRL), if response.hovered() { HOVER } else { RAISED });
+            p.rect_filled(
+                Rect::from_min_size(row.left_top(), Vec2::new(3.0, row.height())),
+                Rounding { nw: R_CTRL, sw: R_CTRL, ne: 0.0, se: 0.0 },
+                ACCENT,
+            );
+            let thumb = Rect::from_min_size(row.left_top() + Vec2::new(SP_M, 10.0), Vec2::new(98.0, 56.0));
+            self.paint_art(ui, thumb, R_CTRL);
+            let text_x = thumb.right() + SP_M;
+            p.text(Pos2::new(text_x, row.top() + 20.0), Align2::LEFT_TOP, "Firing Range", FontId::proportional(T_BODY + 1.0), TEXT);
+            paint_caption(p, Pos2::new(text_x, row.top() + 44.0), Align2::LEFT_TOP, "Selected", ACCENT_HI);
+            paint_icon(p, Icon::Check, Pos2::new(row.right() - 20.0, row.center().y), 14.0, ACCENT_HI);
             picked = response.clicked();
-            ui.add_space(9.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.label(RichText::new("MORE MODES").size(10.0).color(MUTED));
-            ui.label(RichText::new("Coming later").size(13.0).color(SECONDARY));
+            ui.add_space(SP_S);
+            divider(ui);
+            ui.add_space(SP_S);
+            ui.label(caption("More modes").color(MUTED));
+            ui.label(RichText::new("Coming later").size(T_BODY).color(SECONDARY));
         });
         picked
     }
@@ -1402,48 +1681,44 @@ impl LauncherApp {
     fn build_panel(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.build_job else { return };
         let screen = ctx.screen_rect();
-        let size = Vec2::new(560.0_f32.min(screen.width() - RAIL_W - 56.0), 240.0);
-        let pos = Pos2::new(screen.right() - 28.0 - size.x, screen.bottom() - FOOTER_H - 20.0 - size.y);
+        let size = Vec2::new(580.0_f32.min(screen.width() - RAIL_W - 2.0 * GUTTER), 248.0);
+        let pos = Pos2::new(screen.right() - GUTTER - size.x, screen.bottom() - FOOTER_H - SP_L - size.y);
         let mut close = false;
         let mut open_log = false;
         egui::Area::new(egui::Id::new("build-panel")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
             let p = ui.painter();
-            p.rect_filled(rect, Rounding::same(0.0), Color32::from_rgba_unmultiplied(9, 13, 18, 240));
-            p.rect_stroke(rect, Rounding::same(0.0), Stroke::new(1.0_f32, BORDER));
+            p.add(egui::epaint::Shadow { offset: Vec2::new(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(140) }.as_shape(rect, Rounding::same(R_CARD)));
+            p.rect(rect, Rounding::same(R_CARD), Color32::from_rgba_unmultiplied(12, 13, 16, 246), Stroke::new(1.0_f32, BORDER));
             let (status, color) = match job.exit {
-                None => (format!("COMPILING  {}", fmt_duration(job.elapsed())), CYAN),
-                Some(Some(0)) => (format!("STAGED IN {}", fmt_duration(job.elapsed())), CYAN),
-                Some(_) => ("FAILED".to_owned(), RED),
+                None => (format!("COMPILING  {}", fmt_duration(job.elapsed())), ACCENT_HI),
+                Some(Some(0)) => (format!("STAGED IN {}", fmt_duration(job.elapsed())), GOOD),
+                Some(_) => ("FAILED".to_owned(), BAD),
             };
-            p.text(rect.left_top() + Vec2::new(16.0, 13.0), Align2::LEFT_TOP, "BUILD", display_font(18.0), TEXT);
-            p.text(rect.left_top() + Vec2::new(64.0, 17.0), Align2::LEFT_TOP, status, FontId::monospace(11.0), color);
+            let head_y = rect.top() + 22.0;
+            let t = p.text(Pos2::new(rect.left() + SP_L, head_y), Align2::LEFT_CENTER, "BUILD", display_font(T_TITLE + 2.0), TEXT);
+            p.text(Pos2::new(t.right() + SP_M, head_y + 1.0), Align2::LEFT_CENTER, status, FontId::monospace(11.5), color);
 
-            let close_rect = Rect::from_min_size(Pos2::new(rect.right() - 36.0, rect.top() + 6.0), Vec2::splat(30.0));
+            let close_rect = Rect::from_center_size(Pos2::new(rect.right() - 24.0, head_y), Vec2::splat(30.0));
             let close_r = ui.interact(close_rect, egui::Id::new("build-close"), Sense::click());
             if close_r.hovered() {
-                p.rect_filled(close_rect, Rounding::same(0.0), HOVER);
+                p.rect_filled(close_rect, Rounding::same(R_CTRL), HOVER);
             }
-            let c = close_rect.center();
-            let s = Stroke::new(1.2_f32, TEXT);
-            p.line_segment([c + Vec2::new(-4.5, -4.5), c + Vec2::new(4.5, 4.5)], s);
-            p.line_segment([c + Vec2::new(4.5, -4.5), c + Vec2::new(-4.5, 4.5)], s);
+            paint_icon(p, Icon::Close, close_rect.center(), 12.0, if close_r.hovered() { TEXT } else { SECONDARY });
             close = close_r.on_hover_text("Hide (the build keeps going)").clicked();
 
-            let log_rect =
-                Rect::from_min_size(Pos2::new(close_rect.left() - 76.0, rect.top() + 6.0), Vec2::new(70.0, 30.0));
+            let log_rect = Rect::from_min_max(Pos2::new(close_rect.left() - 96.0, close_rect.top()), Pos2::new(close_rect.left() - 4.0, close_rect.bottom()));
             let log_r = ui.interact(log_rect, egui::Id::new("build-log"), Sense::click());
-            p.text(
-                log_rect.center(),
-                Align2::CENTER_CENTER,
-                "OPEN LOG",
-                FontId::proportional(11.0),
-                if log_r.hovered() { TEXT } else { SECONDARY },
-            );
-            open_log = log_r.clicked();
+            if log_r.hovered() {
+                p.rect_filled(log_rect, Rounding::same(R_CTRL), HOVER);
+            }
+            let lc = if log_r.hovered() { TEXT } else { SECONDARY };
+            paint_icon(p, Icon::Doc, Pos2::new(log_rect.left() + 14.0, log_rect.center().y), 13.0, lc);
+            paint_caption(p, Pos2::new(log_rect.left() + 26.0, log_rect.center().y), Align2::LEFT_CENTER, "Open log", lc);
+            open_log = log_r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
 
-            let body =
-                Rect::from_min_max(rect.left_top() + Vec2::new(16.0, 44.0), rect.right_bottom() - Vec2::new(16.0, 12.0));
+            p.hline(rect.x_range().shrink(1.0), rect.top() + 44.0, Stroke::new(1.0_f32, BORDER));
+            let body = Rect::from_min_max(rect.left_top() + Vec2::new(SP_L, 54.0), rect.right_bottom() - Vec2::new(SP_L, SP_M));
             let clipped = p.with_clip_rect(body);
             let lines = job.tail(12);
             let line_h = 15.0;
@@ -1458,7 +1733,7 @@ impl LauncherApp {
                 );
             }
             if job.running() {
-                paint_progress_line(ui, Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), 2.0)), CYAN);
+                paint_progress_line(ui, Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 43.0), Vec2::new(rect.width() - 2.0, 2.0)), ACCENT);
             }
         });
         if open_log {
@@ -1477,45 +1752,128 @@ impl LauncherApp {
 fn line_color(line: &str) -> Color32 {
     let head = line.chars().take(48).collect::<String>().to_ascii_lowercase();
     if head.contains(" error") || head.starts_with("error") || head.contains("panicked") || head.contains("failed") {
-        RED
+        BAD
     } else if head.contains(" warn") || head.starts_with("warning") {
         AMBER
     } else if head.starts_with("staged:") || head.contains("finished") {
-        CYAN
+        GOOD
     } else {
         SECONDARY
     }
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Patch notes: the game's git history, with the installed and staged builds marked.
+// Shared page pieces
 
 fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).font(display_font(46.0)).color(TEXT));
-    ui.add_space(2.0);
-    ui.label(RichText::new(subtitle).size(14.0).color(SECONDARY));
-    ui.add_space(22.0);
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let r = ui.label(RichText::new(title).font(display_font(T_PAGE)).color(TEXT)).rect;
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(r.width(), 3.0), Sense::hover());
+    ui.painter().rect_filled(Rect::from_min_size(bar.min - Vec2::new(0.0, 2.0), Vec2::new(44.0, 3.0)), Rounding::same(1.5), ACCENT);
+    ui.add_space(SP_M);
+    ui.label(RichText::new(subtitle).size(T_BODY + 0.5).color(SECONDARY));
+    ui.add_space(SP_XL + SP_XS);
+    ui.spacing_mut().item_spacing.y = SP_S;
 }
 
-fn chip(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(10.0), color);
-    let size = galley.size() + Vec2::new(14.0, 8.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    if filled {
-        ui.painter().rect_filled(rect, Rounding::same(0.0), color);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(10.0), INK);
-    } else {
-        ui.painter().rect_stroke(rect.shrink(0.5), Rounding::same(0.0), Stroke::new(1.0_f32, color));
-        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
-    }
+/// The card surface every page uses: panel fill (see-through by `alpha`), hairline border, card corners.
+fn card_frame(alpha: u8) -> egui::Frame {
+    egui::Frame::none().fill(glass(PANEL, alpha)).stroke(Stroke::new(1.0_f32, BORDER)).rounding(Rounding::same(R_CARD))
+}
+
+/// A 3 px accent strip down a card's left edge.
+fn accent_edge(p: &egui::Painter, card: Rect) {
+    p.rect_filled(
+        Rect::from_min_size(card.min, Vec2::new(3.0, card.height())),
+        Rounding { nw: R_CARD, sw: R_CARD, ne: 0.0, se: 0.0 },
+        ACCENT,
+    );
+}
+
+fn divider(ui: &mut egui::Ui) {
+    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0_f32, BORDER));
 }
 
 fn same_hash(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }
 
+// -------------------------------------------------------------------------------------------------------------------
+// Patch notes: the game's git history, one update per day (newest first), each commit a note with its body as
+// sub-notes. Titles and highlights are cut from the commit subjects; nothing is written that isn't in the history.
+
+struct Update<'a> {
+    day: &'a str,
+    /// (index in the history, commit): the index says whether it's built yet.
+    commits: Vec<(usize, &'a Commit)>,
+}
+
+fn group_updates(commits: &[Commit], limit_hit: bool) -> Vec<Update<'_>> {
+    let mut out: Vec<Update> = Vec::new();
+    for (i, c) in commits.iter().enumerate() {
+        match out.last_mut() {
+            Some(u) if u.day == c.day => u.commits.push((i, c)),
+            _ => out.push(Update { day: &c.day, commits: vec![(i, c)] }),
+        }
+    }
+    // the oldest day is probably cut off by the history limit: leave it out rather than show it half
+    if limit_hit && out.len() > 1 {
+        out.pop();
+    }
+    out
+}
+
+/// A commit subject's lead: "Ziplines v1: map cables (retail material), ..." -> "Ziplines v1: map cables".
+fn headline(subject: &str) -> String {
+    fn clause(s: &str) -> &str {
+        let cut = [": ", "; ", " (", " - "].iter().filter_map(|p| s.find(p)).min().unwrap_or(s.len());
+        s[..cut].trim()
+    }
+    let lead = match subject.split_once(": ") {
+        Some((topic, rest)) if topic.split_whitespace().count() <= 2 && !rest.trim().is_empty() => format!("{topic}: {}", clause(rest)),
+        Some((topic, _)) => clause(topic).to_owned(),
+        None => clause(subject).to_owned(),
+    };
+    let lead = if lead.chars().count() < 3 { subject.trim().to_owned() } else { lead };
+    shorten(&lead, 78)
+}
+
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let cut = cut.rsplit_once(' ').map(|(a, _)| a).unwrap_or(&cut);
+    format!("{}...", cut.trim_end_matches([',', ';', ':']))
+}
+
+/// "2026-11-21" -> ("26.11.21", "Saturday, November 21", "21", "NOV").
+fn day_labels(day: &str) -> (String, String, String, String) {
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let mut it = day.split('-').map(|p| p.parse::<i32>().ok());
+    let (Some(Some(y)), Some(Some(m)), Some(Some(d))) = (it.next(), it.next(), it.next()) else {
+        return (day.to_owned(), day.to_owned(), String::new(), String::new());
+    };
+    if !(1..=12).contains(&m) {
+        return (day.to_owned(), day.to_owned(), String::new(), String::new());
+    }
+    // Sakamoto's day of the week
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let yy = if m < 3 { y - 1 } else { y };
+    let wd = (yy + yy / 4 - yy / 100 + yy / 400 + T[(m - 1) as usize] + d).rem_euclid(7) as usize;
+    let month = MONTHS[(m - 1) as usize];
+    (
+        format!("{:02}.{:02}.{:02}", y % 100, m, d),
+        format!("{}, {} {}", DAYS[wd], month, d),
+        d.to_string(),
+        month[..3].to_uppercase(),
+    )
+}
+
 impl LauncherApp {
-    fn notes_page(&self, ui: &mut egui::Ui, snap: &Snapshot) {
+    fn notes_page(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         egui::Frame::none().inner_margin(PAGE_MARGIN).show(ui, |ui| {
             let subtitle = match snap.unbuilt {
                 Some(0) => "Recent changes to the game. Your build has all of them.".to_owned(),
@@ -1525,65 +1883,313 @@ impl LauncherApp {
             };
             page_header(ui, "PATCH NOTES", &subtitle);
             if snap.commits.is_empty() {
-                ui.label(RichText::new("No git history in this game folder.").size(14.0).color(MUTED));
+                ui.label(RichText::new("No git history in this game folder.").size(T_BODY).color(MUTED));
                 return;
             }
+            let updates = group_updates(&snap.commits, snap.commits.len() >= game::HISTORY_LEN);
             let playing = snap.current.as_ref().map(|b| b.hash.as_str()).unwrap_or("");
             let staged = snap.next.as_ref().map(|b| b.hash.as_str()).unwrap_or("");
             let unbuilt = snap.unbuilt.unwrap_or(0) as usize;
+            let ctx = NoteCtx { playing, staged, unbuilt };
+            // `--expand-notes`: open the newest two updates (screenshots)
+            if std::env::args().any(|a| a == "--expand-notes") && self.notes_open.is_empty() {
+                self.notes_open.extend(updates.iter().take(2).map(|u| u.day.to_owned()));
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width(ui.available_width() - 8.0);
-                let mut day = "";
-                for (i, c) in snap.commits.iter().enumerate() {
-                    if c.day != day {
-                        day = &c.day;
-                        ui.add_space(if i == 0 { 0.0 } else { 18.0 });
-                        ui.label(RichText::new(&c.day).size(11.0).color(MUTED));
-                        ui.add_space(4.0);
+                ui.set_width((ui.available_width() - SP_M).min(1180.0));
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (i, update) in updates.iter().enumerate() {
+                    let open = self.notes_open.contains(update.day);
+                    let toggle = if i == 0 { self.featured_update(ui, update, open, &ctx) } else { update_row(ui, update, open, &ctx) };
+                    if toggle && !self.notes_open.remove(update.day) {
+                        self.notes_open.insert(update.day.to_owned());
                     }
-                    let row_top = ui.cursor().min.y;
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(2.0);
-                        ui.allocate_ui_with_layout(Vec2::new(64.0, 18.0), Layout::left_to_right(Align::Center), |ui| {
-                            ui.set_width(64.0);
-                            ui.label(RichText::new(&c.hash).monospace().size(13.0).color(MUTED));
-                        });
-                        let chips_w = 230.0;
-                        let text_w = (ui.available_width() - chips_w).max(200.0);
-                        ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                            ui.set_width(text_w);
-                            ui.add(egui::Label::new(RichText::new(&c.subject).size(14.0).color(TEXT)).wrap());
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                            ui.label(RichText::new(format!("{}  {}", c.time, c.ago)).size(11.0).color(MUTED));
-                            ui.add_space(6.0);
-                            if same_hash(&c.hash, playing) {
-                                chip(ui, "PLAYING", CYAN, true);
-                            }
-                            if same_hash(&c.hash, staged) {
-                                chip(ui, "STAGED", CYAN, false);
-                            }
-                            if i < unbuilt {
-                                chip(ui, "NOT BUILT", MUTED, false);
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-                    let y = ui.cursor().min.y - 4.0;
-                    if y > row_top {
-                        ui.painter().hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, BORDER));
+                    ui.add_space(if i == 0 { SP_XL } else { SP_M });
+                    if i == 0 && updates.len() > 1 {
+                        ui.label(caption("Earlier updates").color(MUTED));
+                        ui.add_space(SP_S + 2.0);
                     }
                 }
-                ui.add_space(24.0);
+                ui.add_space(SP_XL);
             });
         });
     }
+
+    /// The newest day as a big card: art, headline, highlights, READ MORE. Returns true when READ MORE was pressed.
+    fn featured_update(&self, ui: &mut egui::Ui, u: &Update, open: bool, nc: &NoteCtx) -> bool {
+        let (version, long_date, _, _) = day_labels(u.day);
+        let mut toggle = false;
+        let newest = u.commits[0].1;
+        let r = card_frame(238).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // header
+            egui::Frame::none().inner_margin(Margin { left: SP_XL + 4.0, right: SP_XL, top: SP_L, bottom: SP_M }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = SP_S;
+                    ui.label(RichText::new("UPDATE").font(display_font(T_UPDATE + 4.0)).color(TEXT));
+                    ui.label(RichText::new(&version).font(display_font(T_UPDATE + 4.0)).color(ACCENT_HI));
+                    ui.add_space(SP_L);
+                    icon_label(ui, Icon::Calendar, &long_date, SECONDARY);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui_pill(ui, "Latest", PillStyle::Accent);
+                        update_pills(ui, u, nc);
+                    });
+                });
+            });
+            divider(ui);
+            egui::Frame::none().inner_margin(Margin { left: SP_XL + 4.0, right: SP_XL, top: SP_L + 2.0, bottom: SP_L + 2.0 }).show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = SP_XL;
+                    let (art, _) = ui.allocate_exact_size(Vec2::new(300.0, 169.0), Sense::hover());
+                    self.paint_art(ui, art, R_CTRL);
+                    ui.painter().rect_stroke(art, Rounding::same(R_CTRL), Stroke::new(1.0_f32, glass(Color32::WHITE, 20)));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = SP_XS;
+                        ui.add(egui::Label::new(RichText::new(headline(&newest.subject)).size(T_TITLE + 2.0).color(TEXT)).wrap());
+                        let n = u.commits.len();
+                        ui.label(
+                            RichText::new(format!("{n} change{}  ·  newest {} ({})  ·  {}", if n == 1 { "" } else { "s" }, newest.time, newest.ago, newest.hash))
+                                .size(T_SMALL)
+                                .color(MUTED),
+                        );
+                        ui.add_space(SP_M);
+                        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(Pos2::new(row.left(), row.center().y - 7.0), Vec2::new(3.0, 14.0)),
+                            Rounding::same(1.5),
+                            ACCENT,
+                        );
+                        paint_caption(ui.painter(), Pos2::new(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, "Patch highlights", SECONDARY);
+                        ui.add_space(2.0);
+                        let mut seen: Vec<String> = Vec::new();
+                        for (_, c) in &u.commits {
+                            let h = headline(&c.subject);
+                            if seen.contains(&h) {
+                                continue;
+                            }
+                            seen.push(h);
+                            if seen.len() > 4 {
+                                break;
+                            }
+                        }
+                        for h in seen.iter().take(4) {
+                            bullet(ui, h, T_BODY, SECONDARY, true);
+                        }
+                        ui.add_space(SP_S);
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            let label = if open { "Show less" } else { "Read more" };
+                            toggle = ghost_button(ui, label, Some(if open { Icon::ChevronUp } else { Icon::ChevronRight }));
+                        });
+                    });
+                });
+            });
+            if open {
+                divider(ui);
+                egui::Frame::none().inner_margin(Margin { left: SP_XL + 4.0, right: SP_XL, top: SP_S, bottom: SP_M }).show(ui, |ui| {
+                    commit_list(ui, u, nc);
+                });
+            }
+        });
+        accent_edge(ui.painter(), r.response.rect);
+        toggle
+    }
+}
+
+struct NoteCtx<'a> {
+    playing: &'a str,
+    staged: &'a str,
+    unbuilt: usize,
+}
+
+/// PLAYING / STAGED / NOT BUILT for a whole update (right-to-left layout).
+fn update_pills(ui: &mut egui::Ui, u: &Update, nc: &NoteCtx) {
+    if u.commits.iter().any(|(_, c)| same_hash(&c.hash, nc.playing)) {
+        ui_pill(ui, "Playing", PillStyle::Solid(GOOD));
+    }
+    if u.commits.iter().any(|(_, c)| same_hash(&c.hash, nc.staged)) && !same_hash(nc.staged, nc.playing) {
+        ui_pill(ui, "Staged", PillStyle::Outline(GOOD));
+    }
+    if u.commits.iter().any(|(i, _)| *i < nc.unbuilt) {
+        ui_pill(ui, "Not built", PillStyle::Outline(MUTED));
+    }
+}
+
+/// One older update: a date tile, its headline and the rest of its topics; a click opens its notes.
+fn update_row(ui: &mut egui::Ui, u: &Update, open: bool, nc: &NoteCtx) -> bool {
+    let (version, long_date, day_num, month) = day_labels(u.day);
+    let id = ui.make_persistent_id(("update", u.day));
+    let hovered = ui.ctx().animate_bool_with_time(id, ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false)), 0.12);
+    let head_h = 76.0;
+    let r = card_frame(232).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::Frame::none().inner_margin(Margin { left: SP_L + 4.0, right: SP_XL, top: SP_M, bottom: SP_M }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_height(head_h - 2.0 * SP_M);
+                ui.spacing_mut().item_spacing.x = SP_L;
+                // date tile
+                let (tile, _) = ui.allocate_exact_size(Vec2::new(52.0, 52.0), Sense::hover());
+                let p = ui.painter();
+                p.rect(tile, Rounding::same(R_CTRL), RAISED, Stroke::new(1.0_f32, BORDER));
+                p.text(tile.center() - Vec2::new(0.0, 6.0), Align2::CENTER_CENTER, &day_num, display_font(26.0), TEXT);
+                paint_caption(p, tile.center() + Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, &month, ACCENT_HI);
+
+                let right_w = 330.0;
+                let text_w = (ui.available_width() - right_w).max(200.0);
+                ui.allocate_ui_with_layout(Vec2::new(text_w, head_h - 2.0 * SP_M), Layout::top_down(Align::Min).with_main_align(Align::Center), |ui| {
+                    ui.set_width(text_w);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(RichText::new(format!("UPDATE {version}")).font(display_font(T_TITLE)).color(ACCENT_HI));
+                    ui.add(egui::Label::new(RichText::new(headline(&u.commits[0].1.subject)).size(T_BODY + 1.5).color(TEXT)).truncate());
+                    let rest: Vec<String> = {
+                        let mut seen = vec![headline(&u.commits[0].1.subject)];
+                        for (_, c) in u.commits.iter().skip(1) {
+                            let h = headline(&c.subject);
+                            if !seen.contains(&h) {
+                                seen.push(h);
+                            }
+                        }
+                        seen.into_iter().skip(1).collect()
+                    };
+                    if !rest.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(format!("Also: {}", rest.join("  ·  "))).size(T_SMALL).color(MUTED)).truncate());
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = SP_S;
+                    let (chev, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    paint_icon(ui.painter(), if open { Icon::ChevronUp } else { Icon::ChevronDown }, chev.center(), 16.0, mix(SECONDARY, TEXT, hovered));
+                    ui.add_space(SP_S);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = SP_XS;
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| icon_label(ui, Icon::Calendar, &long_date, SECONDARY));
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            let n = u.commits.len();
+                            ui.label(RichText::new(format!("{n} change{}", if n == 1 { "" } else { "s" })).size(T_SMALL).color(MUTED));
+                            update_pills(ui, u, nc);
+                        });
+                    });
+                });
+            });
+        });
+        if open {
+            divider(ui);
+            egui::Frame::none().inner_margin(Margin { left: SP_L + 4.0, right: SP_XL, top: SP_S, bottom: SP_M }).show(ui, |ui| {
+                commit_list(ui, u, nc);
+            });
+        }
+    });
+    let card = r.response.rect;
+    let head = Rect::from_min_size(card.min, Vec2::new(card.width(), head_h));
+    let resp = ui.interact(head, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.ctx().data_mut(|d| d.insert_temp(id, resp.hovered()));
+    if hovered > 0.0 {
+        ui.painter().rect_stroke(card, Rounding::same(R_CARD), Stroke::new(1.0_f32, glass(Color32::from_rgb(90, 96, 108), (hovered * 255.0) as u8)));
+    }
+    accent_edge(ui.painter(), card);
+    resp.clicked()
+}
+
+/// Every commit of an update: hash, subject, body notes, time and its build state.
+fn commit_list(ui: &mut egui::Ui, u: &Update, nc: &NoteCtx) {
+    for (n, (i, c)) in u.commits.iter().enumerate() {
+        if n > 0 {
+            divider(ui);
+        }
+        ui.add_space(SP_M);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = SP_L;
+            ui.allocate_ui_with_layout(Vec2::new(64.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(64.0);
+                ui.label(RichText::new(&c.hash).monospace().size(T_MONO).color(MUTED));
+            });
+            let right_w = 210.0;
+            let text_w = (ui.available_width() - right_w).max(200.0);
+            ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(text_w);
+                ui.spacing_mut().item_spacing.y = SP_XS;
+                ui.add(egui::Label::new(RichText::new(&c.subject).size(T_BODY).color(TEXT)).wrap());
+                if !c.body.is_empty() {
+                    ui.add_space(2.0);
+                    for note in &c.body {
+                        bullet(ui, note, T_SMALL, SECONDARY, false);
+                    }
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.x = SP_S;
+                ui.label(RichText::new(&c.time).monospace().size(T_MONO).color(MUTED));
+                if same_hash(&c.hash, nc.playing) {
+                    ui_pill(ui, "Playing", PillStyle::Solid(GOOD));
+                }
+                if same_hash(&c.hash, nc.staged) && !same_hash(nc.staged, nc.playing) {
+                    ui_pill(ui, "Staged", PillStyle::Outline(GOOD));
+                }
+                if *i < nc.unbuilt {
+                    ui_pill(ui, "Not built", PillStyle::Outline(MUTED));
+                }
+            });
+        });
+        ui.add_space(SP_M);
+    }
+}
+
+/// A bulleted line: a small square (accent for highlights) and wrapping text.
+fn bullet(ui: &mut egui::Ui, text: &str, size: f32, color: Color32, accent: bool) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = SP_S + 2.0;
+        let (slot, _) = ui.allocate_exact_size(Vec2::new(6.0, size + 4.0), Sense::hover());
+        let sq = Rect::from_center_size(Pos2::new(slot.center().x, slot.top() + size * 0.62), Vec2::splat(if accent { 5.0 } else { 4.0 }));
+        ui.painter().rect_filled(sq, Rounding::ZERO, if accent { ACCENT } else { MUTED });
+        ui.add(egui::Label::new(RichText::new(text).size(size).color(color)).wrap());
+    });
+}
+
+/// An icon followed by a short text, both in `color` (dates, counts).
+fn icon_label(ui: &mut egui::Ui, icon: Icon, text: &str, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(T_SMALL + 0.5), color);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0 + galley.size().x, galley.size().y.max(16.0)), Sense::hover());
+    paint_icon(ui.painter(), icon, Pos2::new(rect.left() + 7.0, rect.center().y), 14.0, color);
+    ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - galley.size().y / 2.0), galley, color);
 }
 
 // -------------------------------------------------------------------------------------------------------------------
 // Console: the game's own output, live (R5Flowstate's launcher has the same tab).
 
 impl LauncherApp {
+    /// Brings the filtered index list up to date (only the new lines while the filter is unchanged).
+    fn refresh_console_view(&mut self, lines: &[String]) {
+        let source = self.console.as_ref().map(|a| Arc::as_ptr(a) as usize).unwrap_or(0);
+        let v = &mut self.console_view;
+        let same_query = v.source == source && v.filter == self.console_filter && v.problems_only == self.console_problems_only;
+        // at the line cap the oldest lines drop off the front, so indices shift: rescan then
+        let append_only = same_query && lines.len() >= v.len && lines.len() < game::KEEP_LINES;
+        if append_only && lines.len() == v.len {
+            return;
+        }
+        if !append_only {
+            *v = ConsoleView {
+                source,
+                filter: self.console_filter.clone(),
+                problems_only: self.console_problems_only,
+                ..ConsoleView::default()
+            };
+        }
+        let filter = v.filter.to_ascii_lowercase();
+        for (i, line) in lines.iter().enumerate().skip(v.len) {
+            let color = line_color(line);
+            if color == BAD {
+                v.errors += 1;
+            } else if color == AMBER {
+                v.warnings += 1;
+            }
+            let problem = color == BAD || color == AMBER;
+            if (!v.problems_only || problem) && (filter.is_empty() || line.to_ascii_lowercase().contains(&filter)) {
+                v.shown.push(i);
+            }
+        }
+        v.len = lines.len();
+    }
+
     fn console_page(&mut self, ui: &mut egui::Ui, phase: PlayPhase) {
         let log_path = game::data_dir().unwrap_or_default().join("game.log");
         egui::Frame::none().inner_margin(PAGE_MARGIN).show(ui, |ui| {
@@ -1594,74 +2200,92 @@ impl LauncherApp {
             };
             page_header(ui, "CONSOLE", subtitle);
 
-            let lines: Vec<String> = self.console.as_ref().map(|l| l.lock().unwrap().clone()).unwrap_or_default();
+            let source = self.console.clone();
+            let empty = Mutex::new(Vec::new());
+            let guard = match &source {
+                Some(arc) => arc.lock().unwrap(),
+                None => empty.lock().unwrap(),
+            };
+            let lines: &[String] = &guard;
+
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SP_S;
                 ui.add(
                     egui::TextEdit::singleline(&mut self.console_filter)
-                        .hint_text(RichText::new("Filter").color(MUTED))
-                        .font(FontId::monospace(12.0))
-                        .margin(Margin::symmetric(10.0, 8.0))
-                        .desired_width(280.0),
+                        .hint_text(RichText::new("Filter lines").color(MUTED))
+                        .font(FontId::monospace(T_MONO))
+                        .margin(Margin::symmetric(SP_M, SP_S))
+                        .desired_width(300.0),
                 );
-                ui.add_space(8.0);
+                ui.add_space(SP_M);
                 toggle(ui, &mut self.console_problems_only, true);
-                ui.label(RichText::new("Warnings and errors only").size(13.0).color(SECONDARY));
+                ui.label(RichText::new("Warnings and errors only").size(T_BODY - 0.5).color(SECONDARY));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if flat_button(ui, "OPEN LOG FILE")
+                    if ghost_button(ui, "Open log file", Some(Icon::Doc))
                         && let Err(e) = game::open_path(&log_path)
                     {
                         self.notice = Some((e, Tone::Bad));
                     }
-                    if flat_button(ui, "COPY") {
+                    if ghost_button(ui, "Copy", Some(Icon::Copy)) {
                         ui.ctx().copy_text(lines.join("\n"));
                         self.notice = Some((format!("Copied {} lines.", lines.len()), Tone::Info));
                     }
                 });
             });
-            ui.add_space(12.0);
+            ui.add_space(SP_L);
+            self.refresh_console_view(lines);
+            let v = &self.console_view;
 
-            let filter = self.console_filter.to_ascii_lowercase();
-            let problems_only = self.console_problems_only;
-            let shown: Vec<&String> = lines
-                .iter()
-                .filter(|l| !problems_only || matches!(line_color(l), RED | AMBER))
-                .filter(|l| filter.is_empty() || l.to_ascii_lowercase().contains(&filter))
-                .collect();
-
-            egui::Frame::none().fill(PANEL).inner_margin(Margin::same(14.0)).show(ui, |ui| {
+            card_frame(236).fill(Color32::from_rgba_unmultiplied(9, 10, 12, 240)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.set_height((ui.available_height() - 24.0).max(120.0));
-                if shown.is_empty() {
-                    let msg = if lines.is_empty() {
-                        "Nothing yet. Press Play and the game's output shows up here."
-                    } else {
-                        "No lines match."
-                    };
-                    ui.label(RichText::new(msg).size(14.0).color(MUTED));
-                    return;
-                }
-                let row_h = 17.0;
-                egui::ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(true).show_rows(
-                    ui,
-                    row_h,
-                    shown.len(),
-                    |ui, range| {
+                // status strip
+                egui::Frame::none().inner_margin(Margin::symmetric(SP_L, SP_S + 2.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = SP_L;
+                        let live = matches!(phase, PlayPhase::Ours | PlayPhase::Starting);
+                        if live {
+                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.5, GOOD);
+                        }
+                        ui.label(caption(if live { "Live" } else { "Last session" }).color(if live { GOOD } else { SECONDARY }));
+                        ui.label(RichText::new(format!("{} lines", lines.len())).size(T_SMALL).color(MUTED));
+                        ui.label(RichText::new(format!("{} warnings", v.warnings)).size(T_SMALL).color(if v.warnings > 0 { AMBER } else { MUTED }));
+                        ui.label(RichText::new(format!("{} errors", v.errors)).size(T_SMALL).color(if v.errors > 0 { BAD } else { MUTED }));
+                        if v.shown.len() != lines.len() {
+                            ui.label(RichText::new(format!("{} shown", v.shown.len())).size(T_SMALL).color(SECONDARY));
+                        }
+                    });
+                });
+                divider(ui);
+                egui::Frame::none().inner_margin(Margin::same(SP_L)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_height((ui.available_height() - SP_XL - 2.0 * SP_L).max(120.0));
+                    if v.shown.is_empty() {
+                        let msg = if lines.is_empty() { "Nothing yet. Press Play and the game's output shows up here." } else { "No lines match." };
+                        ui.label(RichText::new(msg).size(T_BODY).color(MUTED));
+                        return;
+                    }
+                    // rows must be exactly row_h tall, or show_rows picks the wrong range and leaves a gap
+                    // (show_rows adds item_spacing.y per row, so that has to be 0 before the call, not inside it)
+                    let row_h = ui.fonts(|f| f.row_height(&FontId::monospace(T_MONO + 0.5))).ceil() + 2.0;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    egui::ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(true).show_rows(ui, row_h, v.shown.len(), |ui, range| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for line in &shown[range] {
+                        for &idx in &v.shown[range] {
+                            let line = &lines[idx];
                             let (prefix, rest) = split_log_prefix(line);
                             ui.horizontal(|ui| {
                                 ui.set_height(row_h);
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 if !prefix.is_empty() {
-                                    let p = RichText::new(prefix).monospace().size(13.0).color(MUTED);
-                                    ui.add(egui::Label::new(p).extend());
+                                    ui.add(egui::Label::new(RichText::new(prefix).monospace().size(T_MONO + 0.5).color(MUTED)).extend());
                                 }
-                                let r = RichText::new(rest).monospace().size(13.0).color(line_color(line));
+                                let r = RichText::new(rest).monospace().size(T_MONO + 0.5).color(line_color(line));
                                 ui.add(egui::Label::new(r).extend());
                             });
                         }
-                    },
-                );
+                    });
+                });
             });
         });
     }
@@ -1679,23 +2303,45 @@ fn split_log_prefix(line: &str) -> (&str, &str) {
 }
 
 // -------------------------------------------------------------------------------------------------------------------
-// Settings
+// Settings and the shared controls
 
-fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).font(display_font(19.0)).color(TEXT));
-    ui.add_space(6.0);
-    egui::Frame::none()
-        .fill(glass(PANEL, 214))
-        .stroke(Stroke::new(1.0_f32, glass(Color32::WHITE, 16)))
-        .inner_margin(Margin::same(20.0))
-        .show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        body(ui);
+/// A settings group: an accent-barred display title, then a card; `note` is the card's footer strip.
+fn section(ui: &mut egui::Ui, title: &str, note: Option<(&str, Color32)>, body: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 20.0), Sense::hover());
+        ui.painter().rect_filled(bar, Rounding::same(1.5), ACCENT);
+        ui.add_space(2.0);
+        ui.label(RichText::new(title).font(display_font(T_SECTION)).color(TEXT));
     });
-    ui.add_space(22.0);
+    ui.add_space(SP_S);
+    card_frame(236).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::Frame::none().inner_margin(Margin::symmetric(SP_XL, SP_L + 2.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = SP_S;
+            body(ui);
+        });
+        if let Some((text, color)) = note {
+            divider(ui);
+            egui::Frame::none().fill(glass(BG, 90)).inner_margin(Margin::symmetric(SP_XL, SP_M)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(text).size(T_SMALL).color(color));
+            });
+        }
+    });
+    ui.add_space(SP_2XL);
 }
 
-/// A quick chip: small label, the current value, a caret; a click opens `menu` above it.
+/// The fixed-width label column of a settings row.
+fn row_label(ui: &mut egui::Ui, title: &str, enabled: bool) {
+    ui.allocate_ui_with_layout(Vec2::new(LABEL_W, 28.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_width(LABEL_W);
+        ui.label(RichText::new(title).size(T_BODY).color(if enabled { TEXT } else { MUTED }));
+    });
+}
+
+/// A chip: small caption, the current value, a chevron; a click opens `menu` above it.
 fn quick_chip(ui: &mut egui::Ui, label: &str, value: &str, enabled: bool, menu: impl FnOnce(&mut egui::Ui)) {
     let id = ui.make_persistent_id(("quick-chip", label));
     // `--open-chip=<LABEL>`: keep that menu open (screenshots of the menus)
@@ -1703,24 +2349,23 @@ fn quick_chip(ui: &mut egui::Ui, label: &str, value: &str, enabled: bool, menu: 
         ui.memory_mut(|m| m.open_popup(id));
     }
     let open = ui.memory(|m| m.is_popup_open(id));
-    let lf = FontId::proportional(10.5);
-    let vf = FontId::proportional(14.5);
-    let lw = ui.painter().layout_no_wrap(label.to_owned(), lf.clone(), MUTED).size().x;
+    let lg = caption_galley(ui.painter(), label, T_CAPTION, MUTED);
+    let vf = FontId::proportional(T_BODY + 0.5);
     let vw = ui.painter().layout_no_wrap(value.to_owned(), vf.clone(), TEXT).size().x;
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(16.0 + lw + 10.0 + vw + 30.0, 40.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(SP_L + lg.size().x + 10.0 + vw + 34.0, 44.0), Sense::click());
     let hover = ui.ctx().animate_bool_with_time(response.id, enabled && (response.hovered() || open), 0.12);
     let p = ui.painter();
-    p.rect_filled(rect, Rounding::same(0.0), mix(RAISED, HOVER, hover));
-    if open {
-        p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - 2.0), Vec2::new(rect.width(), 2.0)), Rounding::same(0.0), CYAN);
-    }
+    p.rect(
+        rect.shrink(0.5),
+        Rounding::same(R_CTRL),
+        mix(glass(PANEL, 255), HOVER, hover * 0.7),
+        Stroke::new(1.0_f32, if open { ACCENT } else { mix(BORDER, Color32::from_rgb(70, 76, 86), hover) }),
+    );
     let cy = rect.center().y;
-    p.text(Pos2::new(rect.left() + 16.0, cy), Align2::LEFT_CENTER, label, lf, MUTED);
-    p.text(Pos2::new(rect.left() + 16.0 + lw + 10.0, cy), Align2::LEFT_CENTER, value, vf, if enabled { TEXT } else { SECONDARY });
-    let c = Pos2::new(rect.right() - 15.0, cy + 1.0);
-    let s = Stroke::new(1.4_f32, if open { CYAN } else { SECONDARY });
-    p.line_segment([c + Vec2::new(-4.0, 2.0), c + Vec2::new(0.0, -2.0)], s);
-    p.line_segment([c + Vec2::new(0.0, -2.0), c + Vec2::new(4.0, 2.0)], s);
+    let lx = rect.left() + SP_L;
+    p.galley(Pos2::new(lx, cy - lg.size().y / 2.0), lg.clone(), MUTED);
+    p.text(Pos2::new(lx + lg.size().x + 10.0, cy), Align2::LEFT_CENTER, value, vf, if enabled { TEXT } else { SECONDARY });
+    paint_icon(p, if open { Icon::ChevronDown } else { Icon::ChevronUp }, Pos2::new(rect.right() - 17.0, cy), 13.0, if open { ACCENT_HI } else { SECONDARY });
     let response = if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response.on_hover_text("Close the game to change this") };
     if enabled && response.clicked() {
         ui.memory_mut(|m| m.toggle_popup(id));
@@ -1739,52 +2384,73 @@ fn quick_chip(ui: &mut egui::Ui, label: &str, value: &str, enabled: bool, menu: 
     );
 }
 
-/// One choice in a chip's menu: full width, a cyan bar when it's the current one. Returns true when clicked.
+fn menu_hint(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(SP_XS);
+    ui.label(RichText::new(text).size(T_SMALL - 0.5).color(MUTED));
+    ui.add_space(SP_XS);
+}
+
+/// One choice in a chip's menu: full width, an accent bar and a check when it's the current one.
 fn menu_row(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
-    let (rect, r) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
     let p = ui.painter();
-    if r.hovered() {
-        p.rect_filled(rect, Rounding::same(0.0), HOVER);
+    if r.hovered() || selected {
+        p.rect_filled(rect, Rounding::same(R_CTRL), if r.hovered() { HOVER } else { RAISED });
     }
     if selected {
-        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())), Rounding::same(0.0), CYAN);
+        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), Rounding { nw: R_CTRL, sw: R_CTRL, ne: 0.0, se: 0.0 }, ACCENT);
+        paint_icon(p, Icon::Check, Pos2::new(rect.right() - 16.0, rect.center().y), 13.0, ACCENT_HI);
     }
-    p.text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.5), if selected { CYAN } else { TEXT });
+    p.text(Pos2::new(rect.left() + SP_M + 2.0, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(T_BODY - 0.5), TEXT);
     r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// A labelled path with a CHANGE button (sets `pick` when clicked).
 fn path_row(ui: &mut egui::Ui, label: &str, path: &str, ok: bool, pick: &mut bool) {
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(64.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_width(64.0);
-            ui.label(RichText::new(label).size(10.5).color(MUTED));
+        ui.allocate_ui_with_layout(Vec2::new(72.0, 32.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(72.0);
+            ui.label(caption(label).color(MUTED));
         });
-        let w = (ui.available_width() - 96.0).max(80.0);
-        ui.allocate_ui_with_layout(Vec2::new(w, 22.0), Layout::left_to_right(Align::Center), |ui| {
+        let w = (ui.available_width() - 112.0).max(80.0);
+        ui.allocate_ui_with_layout(Vec2::new(w, 32.0), Layout::left_to_right(Align::Center), |ui| {
             ui.set_width(w);
-            ui.add(egui::Label::new(RichText::new(path).monospace().size(13.0).color(if ok { TEXT } else { AMBER })).truncate());
+            ui.add(egui::Label::new(RichText::new(path).monospace().size(T_MONO + 0.5).color(if ok { TEXT } else { AMBER })).truncate());
         });
-        *pick = flat_button(ui, "CHANGE");
+        *pick = ghost_button(ui, "Change", Some(Icon::Folder));
     });
-    ui.add_space(4.0);
 }
 
-fn flat_button(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add(
-        egui::Button::new(RichText::new(text).size(12.0).color(TEXT))
-            .stroke(Stroke::NONE)
-            .rounding(Rounding::same(0.0))
-            .min_size(Vec2::new(0.0, 34.0)),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .clicked()
+/// The secondary button everywhere: raised fill, hairline border, optional icon, tracked caption text.
+fn ghost_button(ui: &mut egui::Ui, text: &str, icon: Option<Icon>) -> bool {
+    let galley = caption_galley(ui.painter(), text, T_CAPTION + 0.5, TEXT);
+    let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
+    let size = Vec2::new(galley.size().x + icon_w + 2.0 * SP_M + 2.0, 32.0);
+    let (rect, r) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(r.id, r.hovered(), 0.1);
+    let pressed = r.is_pointer_button_down_on();
+    let fill = mix(RAISED, HOVER, hover);
+    let p = ui.painter();
+    p.rect(
+        rect.shrink(0.5),
+        Rounding::same(R_CTRL),
+        if pressed { fill.gamma_multiply(0.85) } else { fill },
+        Stroke::new(1.0_f32, mix(BORDER, Color32::from_rgb(74, 80, 90), hover)),
+    );
+    let mut x = rect.left() + SP_M + 1.0;
+    let color = mix(SECONDARY, TEXT, hover.max(0.6));
+    if let Some(icon) = icon {
+        paint_icon(p, icon, Pos2::new(x + 7.0, rect.center().y), 14.0, color);
+        x += icon_w;
+    }
+    p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, color);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-/// A switch, drawn like R5Regenis' (Theme/Styles.axaml `ToggleButton.switch`): a 42x24 pill with a hairline
-/// border and a 16px knob that slides right and turns cyan when on.
+/// A switch: a 40x22 pill; off is dark with a grey knob, on is accent with a white knob.
 fn toggle(ui: &mut egui::Ui, value: &mut bool, enabled: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(42.0, 24.0), Sense::click());
+    let (slot, response) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
+    let rect = Rect::from_center_size(slot.center(), Vec2::new(40.0, 22.0));
     let mut changed = false;
     if enabled && response.clicked() {
         *value = !*value;
@@ -1792,21 +2458,19 @@ fn toggle(ui: &mut egui::Ui, value: &mut bool, enabled: bool) -> bool {
     }
     let t = ui.ctx().animate_bool_with_time(response.id, *value, 0.14);
     let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), enabled && response.hovered(), 0.12);
-    let off_border = mix(Color32::from_rgb(44, 56, 72), Color32::from_rgb(70, 84, 102), hover);
     let (fill, border, knob) = if enabled {
         (
-            mix(BG, Color32::from_rgb(14, 52, 64), t),
-            mix(off_border, Color32::from_rgb(38, 150, 180), t),
-            mix(mix(MUTED, SECONDARY, hover), CYAN, t),
+            mix(mix(BG, RAISED, hover), ACCENT, t),
+            mix(mix(Color32::from_rgb(60, 65, 74), Color32::from_rgb(86, 92, 102), hover), ACCENT, t),
+            mix(mix(MUTED, SECONDARY, hover), Color32::WHITE, t),
         )
     } else {
-        (BG, Color32::from_rgb(32, 40, 52), Color32::from_rgb(58, 66, 78))
+        (BG, BORDER, Color32::from_rgb(64, 68, 76))
     };
     let p = ui.painter();
-    p.rect_filled(rect, Rounding::same(12.0), fill);
-    p.rect_stroke(rect.shrink(0.5), Rounding::same(12.0), Stroke::new(1.0_f32, border));
-    let knob_x = egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, t);
-    p.circle_filled(Pos2::new(knob_x, rect.center().y), 8.0, knob);
+    p.rect(rect, Rounding::same(11.0), fill, Stroke::new(1.0_f32, border));
+    let knob_x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
+    p.circle_filled(Pos2::new(knob_x, rect.center().y), 7.0, knob);
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
@@ -1815,48 +2479,56 @@ fn toggle(ui: &mut egui::Ui, value: &mut bool, enabled: bool) -> bool {
 
 fn toggle_row(ui: &mut egui::Ui, value: &mut bool, title: &str, hint: &str, enabled: bool) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = SP_M;
         changed = toggle(ui, value, enabled);
-        ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
-            ui.label(RichText::new(hint).size(12.0).color(MUTED));
+            ui.label(RichText::new(title).size(T_BODY).color(if enabled { TEXT } else { MUTED }));
+            ui.label(RichText::new(hint).size(T_SMALL).color(MUTED));
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(SP_XS);
     changed
+}
+
+/// One segment of a segmented control.
+fn segment(ui: &mut egui::Ui, label: &str, on: bool, enabled: bool) -> egui::Response {
+    let galley = caption_galley(ui.painter(), label, T_CAPTION + 0.5, TEXT);
+    let size = Vec2::new((galley.size().x + 2.0 * SP_M + 2.0).max(48.0), 30.0);
+    let (rect, r) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    let hover = ui.ctx().animate_bool_with_time(r.id, enabled && r.hovered() && !on, 0.1);
+    let (fill, stroke, text) = match (on, enabled) {
+        (true, true) => (ACCENT, Stroke::NONE, Color32::WHITE),
+        (true, false) => (HOVER, Stroke::NONE, SECONDARY),
+        (false, true) => (mix(RAISED, HOVER, hover), Stroke::new(1.0_f32, mix(BORDER, Color32::from_rgb(74, 80, 90), hover)), mix(SECONDARY, TEXT, hover)),
+        (false, false) => (RAISED, Stroke::new(1.0_f32, BORDER), MUTED),
+    };
+    let p = ui.painter();
+    p.rect(rect.shrink(0.5), Rounding::same(R_CTRL), fill, stroke);
+    p.galley(rect.center() - galley.size() / 2.0, galley, text);
+    if enabled { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r }
 }
 
 /// A row of segmented choices (label + options). Returns true when the selection changed.
 fn choice_row<T: PartialEq + Clone>(ui: &mut egui::Ui, title: &str, value: &mut T, options: &[(T, &str)], enabled: bool) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(170.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_width(170.0);
-            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
-        });
-        ui.spacing_mut().item_spacing.x = 2.0;
+        row_label(ui, title, enabled);
+        ui.spacing_mut().item_spacing.x = SP_XS;
         for (v, label) in options {
             let on = *value == *v;
-            let text = RichText::new(*label).size(12.0).color(if on { INK } else if enabled { TEXT } else { MUTED });
-            let b = egui::Button::new(text)
-                .fill(if on { if enabled { CYAN } else { MUTED } } else { RAISED })
-                .stroke(Stroke::NONE)
-                .rounding(Rounding::same(0.0))
-                .min_size(Vec2::new(0.0, 26.0));
-            let r = ui.add_enabled(enabled, b);
-            if r.clicked() && !on {
+            if segment(ui, label, on, enabled).clicked() && !on {
                 *value = v.clone();
                 changed = true;
             }
         }
     });
-    ui.add_space(4.0);
     changed
 }
 
 /// Returns true once the value has settled (drag released, or a click / keyboard change).
+#[allow(clippy::too_many_arguments)]
 fn slider_row(
     ui: &mut egui::Ui,
     title: &str,
@@ -1869,29 +2541,40 @@ fn slider_row(
 ) -> bool {
     let mut settled = false;
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(170.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_width(170.0);
-            ui.label(RichText::new(title).size(14.0).color(if enabled { TEXT } else { MUTED }));
-        });
+        row_label(ui, title, enabled);
         let slider = egui::Slider::new(value, range).step_by(step).show_value(false).trailing_fill(true);
-        // A smaller knob drawn as a cyan ring (the rail and the knob share the widget fill in egui).
+        // the knob is a ring in the accent over a dark centre; the filled part of the rail is the accent
         let r = ui
             .scope(|ui| {
                 ui.spacing_mut().interact_size.y = 18.0;
+                ui.visuals_mut().selection.bg_fill = if enabled { ACCENT } else { HOVER };
                 let w = &mut ui.visuals_mut().widgets;
-                w.inactive.fg_stroke = Stroke::new(2.0_f32, CYAN);
-                w.hovered.fg_stroke = Stroke::new(2.0_f32, CYAN_HI);
-                w.active.fg_stroke = Stroke::new(2.0_f32, CYAN_HI);
+                for v in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                    v.bg_fill = BG;
+                    v.weak_bg_fill = BG;
+                }
+                w.inactive.fg_stroke = Stroke::new(2.5_f32, ACCENT);
+                w.hovered.fg_stroke = Stroke::new(2.5_f32, ACCENT_HI);
+                w.active.fg_stroke = Stroke::new(2.5_f32, ACCENT_HI);
                 ui.add_enabled(enabled, slider)
             })
             .inner;
-        ui.add_space(10.0);
+        ui.add_space(SP_M);
         let shown = format!("{:.*}{suffix}", decimals, *value);
-        ui.label(RichText::new(shown).monospace().size(14.0).color(if enabled { TEXT } else { MUTED }));
+        ui.label(RichText::new(shown).monospace().size(T_BODY).color(if enabled { TEXT } else { MUTED }));
         settled = r.drag_stopped() || (r.changed() && !r.dragged());
     });
-    ui.add_space(4.0);
     settled
+}
+
+/// A coloured dot and a sentence: the state lines in Settings.
+fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = SP_S;
+        let (dot, _) = ui.allocate_exact_size(Vec2::new(8.0, 16.0), Sense::hover());
+        ui.painter().circle_filled(dot.center(), 3.5, color);
+        ui.label(RichText::new(text).size(T_SMALL + 0.5).color(if color == MUTED { SECONDARY } else { color }));
+    });
 }
 
 impl LauncherApp {
@@ -1902,44 +2585,30 @@ impl LauncherApp {
         egui::Frame::none().inner_margin(PAGE_MARGIN).show(ui, |ui| {
             page_header(ui, "SETTINGS", "How the game plays, where it lives, and how it starts.");
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_max_width(780.0);
+                ui.set_max_width(860.0);
+                let editable = phase == PlayPhase::Idle;
 
-                section(ui, "GAME", |ui| {
-                    let editable = phase == PlayPhase::Idle;
+                let game_note = if editable {
+                    ("Saved to r5rust_settings.toml. Keybinds live in the game's menu (Esc).", MUTED)
+                } else {
+                    ("Close the game to change these: it saves its own settings when it exits.", AMBER)
+                };
+                section(ui, "GAME", Some(game_note), |ui| {
                     let s = &mut self.settings;
                     let mut save = false;
                     save |= slider_row(ui, "Field of view", &mut s.fov, 70.0..=120.0, 1.0, "°", 0, editable);
                     save |= slider_row(ui, "Mouse sensitivity", &mut s.sensitivity, 0.1..=10.0, 0.05, "", 2, editable);
-                    ui.add_space(8.0);
-                    save |= toggle_row(
-                        ui,
-                        &mut s.auto_sprint,
-                        "Auto sprint",
-                        "Moving forward sprints on its own, like Apex's setting.",
-                        editable,
-                    );
-                    save |= toggle_row(
-                        ui,
-                        &mut s.mantle_boost,
-                        "Mantle boost",
-                        "R5Flowstate's jump at the end of a mantle. Not in stock Apex.",
-                        editable,
-                    );
+                    ui.add_space(SP_S);
+                    save |= toggle_row(ui, &mut s.auto_sprint, "Auto sprint", "Moving forward sprints on its own, like Apex's setting.", editable);
+                    save |= toggle_row(ui, &mut s.mantle_boost, "Mantle boost", "R5Flowstate's jump at the end of a mantle. Not in stock Apex.", editable);
                     save |= toggle_row(ui, &mut s.invert_y, "Invert look", "Moving the mouse up looks down.", editable);
                     if save && let Err(e) = s.save(&self.game_root) {
                         err = Some(e);
                     }
-                    ui.add_space(4.0);
-                    let note = if editable {
-                        "Saved to r5rust_settings.toml. Keybinds live in the game's menu (Esc)."
-                    } else {
-                        "Close the game to change these: it saves its own settings when it exits."
-                    };
-                    ui.label(RichText::new(note).size(12.0).color(if editable { MUTED } else { AMBER }));
                 });
 
-                section(ui, "GRAPHICS", |ui| {
-                    let editable = phase == PlayPhase::Idle;
+                let gfx_note = "Lighting and effects always render like Apex: presets only trade detail and resolution. Texture quality applies on the next launch, the rest live in game too (Esc > Video).";
+                section(ui, "GRAPHICS", Some((gfx_note, MUTED)), |ui| {
                     let g = &mut self.settings.graphics;
                     let mut save = false;
                     let mut preset = g.preset.clone();
@@ -1950,9 +2619,12 @@ impl LauncherApp {
                         save = true;
                     }
                     if g.preset == "custom" {
-                        ui.label(RichText::new("Custom: the knobs below don't match a preset.").size(12.0).color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_W + SP_S);
+                            ui.label(RichText::new("Custom: the settings below don't match a preset.").size(T_SMALL).color(MUTED));
+                        });
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(SP_XS);
                     let mut knobs = false;
                     let levels = |n: &[&str]| -> Vec<(String, String)> { n.iter().map(|v| (v.to_string(), v.to_uppercase())).collect() };
                     let tex = levels(&game::TEXTURE_LEVELS);
@@ -1972,6 +2644,7 @@ impl LauncherApp {
                         save = true;
                     }
                     save |= choice_row(ui, "FPS cap", &mut g.fps_cap, &[(0, "NONE"), (60, "60"), (120, "120"), (144, "144"), (165, "165"), (240, "240"), (360, "360")], editable);
+                    ui.add_space(SP_XS);
                     save |= toggle_row(ui, &mut g.vsync, "V-Sync", "Waits for the display: no tearing, a frame of extra input lag.", editable);
                     if knobs {
                         g.preset = g.detect_preset();
@@ -1980,36 +2653,32 @@ impl LauncherApp {
                     if save && let Err(e) = self.settings.save(&self.game_root) {
                         err = Some(e);
                     }
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Lighting and effects always render like Apex: presets only trade detail and resolution. Texture quality applies on the next launch, the rest live in game too (Esc > Video).")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
                 });
 
-                section(ui, "LAUNCH OPTIONS", |ui| {
+                section(ui, "LAUNCH OPTIONS", None, |ui| {
                     let edit = egui::TextEdit::singleline(&mut self.launch_args)
                         .hint_text(RichText::new("e.g. --fly --fov 110").color(MUTED))
-                        .font(FontId::monospace(13.0))
-                        .margin(Margin::symmetric(10.0, 9.0))
+                        .font(FontId::monospace(T_MONO + 0.5))
+                        .margin(Margin::symmetric(SP_M, SP_S + 1.0))
                         .desired_width(f32::INFINITY);
                     if ui.add(edit).changed()
                         && let Err(e) = game::write_setting("launch_args.txt", &self.launch_args)
                     {
                         err = Some(format!("Couldn't save launch options: {e}"));
                     }
-                    ui.add_space(6.0);
                     let args = game::split_args(&self.launch_args)
                         .iter()
                         .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
                         .collect::<Vec<_>>()
                         .join(" ");
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("RUNS").size(10.0).color(MUTED));
-                        ui.label(RichText::new(format!("r5rust.exe {args}")).monospace().size(13.0).color(CYAN));
+                        ui.label(caption("Runs").color(MUTED));
+                        ui.label(RichText::new(format!("r5rust.exe {args}")).monospace().size(T_MONO + 0.5).color(ACCENT_HI));
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(SP_XS);
+                    divider(ui);
+                    ui.add_space(SP_XS);
+                    ui.spacing_mut().item_spacing.y = SP_XS;
                     for (flag, what) in [
                         ("--fly", "free-fly camera, no collision"),
                         ("--fov <deg>", "field of view for this run only"),
@@ -2018,76 +2687,71 @@ impl LauncherApp {
                         ("--menu", "open the in-game menu at start"),
                     ] {
                         ui.horizontal(|ui| {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(200.0, 16.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.set_width(200.0);
-                                    ui.label(RichText::new(flag).monospace().size(12.0).color(TEXT));
-                                },
-                            );
-                            ui.label(RichText::new(what).size(12.0).color(MUTED));
+                            ui.allocate_ui_with_layout(Vec2::new(LABEL_W + 30.0, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                                ui.set_width(LABEL_W + 30.0);
+                                ui.label(RichText::new(flag).monospace().size(T_MONO).color(TEXT));
+                            });
+                            ui.label(RichText::new(what).size(T_SMALL).color(MUTED));
                         });
                     }
                 });
 
-                section(ui, "GAME FOLDER", |ui| {
-                    ui.label(RichText::new(self.game_root.display().to_string()).monospace().size(14.0).color(TEXT));
+                section(ui, "GAME FOLDER", None, |ui| {
+                    ui.label(RichText::new(self.game_root.display().to_string()).monospace().size(T_BODY).color(TEXT));
                     let (state, color) = match snap.state {
-                        GameState::Ready => ("R5Rust project with a build ready to play", CYAN),
+                        GameState::Ready => ("R5Rust project with a build ready to play", GOOD),
                         GameState::NoBuild => ("R5Rust project, nothing built yet", AMBER),
-                        GameState::FolderMissing => ("This folder doesn't exist", RED),
-                        GameState::InvalidFolder => ("Not an R5Rust project (no play.ps1)", RED),
+                        GameState::FolderMissing => ("This folder doesn't exist", BAD),
+                        GameState::InvalidFolder => ("Not an R5Rust project (no play.ps1)", BAD),
                     };
-                    ui.label(RichText::new(state).size(12.0).color(color));
-                    ui.add_space(10.0);
+                    status_dot(ui, state, color);
+                    ui.add_space(SP_XS);
                     ui.horizontal(|ui| {
-                        browse = flat_button(ui, "CHANGE FOLDER");
-                        if flat_button(ui, "OPEN FOLDER") {
+                        browse = ghost_button(ui, "Change folder", Some(Icon::Folder));
+                        if ghost_button(ui, "Open folder", Some(Icon::ChevronRight)) {
                             err = game::open_path(&self.game_root).err();
                         }
                     });
                 });
 
-                section(ui, "GAME FILES", |ui| {
+                let files_note = "Install builds the files from your Apex install (tools\\install.ps1) and points the game at them (assets_root in r5rust.toml).";
+                section(ui, "GAME FILES", Some((files_note, MUTED)), |ui| {
                     let f = &snap.files;
                     let dir = f.assets_root.join("maps").join(&f.map);
-                    ui.label(RichText::new(dir.display().to_string()).monospace().size(14.0).color(TEXT));
-                    let (state, color) = if f.ok() {
-                        ("Map extracted: world, collision, materials and lighting found.".to_owned(), CYAN)
+                    ui.label(RichText::new(dir.display().to_string()).monospace().size(T_BODY).color(TEXT));
+                    if f.ok() {
+                        status_dot(ui, "Map extracted: world, collision, materials and lighting found.", GOOD);
                     } else {
                         let missing = f.missing.join(", ");
-                        (format!("Missing {missing}. Install builds them from your own Apex install."), AMBER)
-                    };
-                    ui.label(RichText::new(state).size(12.0).color(color));
+                        status_dot(ui, &format!("Missing {missing}. Install builds them from your own Apex install."), AMBER);
+                    }
                     let art = if f.loadscreen.is_some() {
                         "Loading screen found (shown on the Play page)."
                     } else {
                         "No loading screen extracted: the Play page shows a plain backdrop."
                     };
-                    ui.label(RichText::new(art).size(12.0).color(MUTED));
-                    ui.add_space(10.0);
+                    status_dot(ui, art, MUTED);
                     let (install, install_color) = match &self.install_status {
                         InstallStatus::Checking => ("Checking the install...".to_owned(), MUTED),
-                        InstallStatus::Installed(d) => (format!("Installed {d}"), MUTED),
+                        InstallStatus::Installed(d) => (format!("Installed {d}"), GOOD),
                         InstallStatus::Partial(d) => (format!("Install not finished: {d}"), AMBER),
                         InstallStatus::Stale(d) => (format!("Update needed: {d}"), AMBER),
                         InstallStatus::Missing(_) => ("Not installed yet.".to_owned(), AMBER),
                         InstallStatus::Unknown(d) => (format!("Couldn't check the install: {d}"), MUTED),
                     };
-                    ui.label(RichText::new(install).size(12.0).color(install_color));
-                    ui.add_space(10.0);
+                    status_dot(ui, &install, install_color);
+                    ui.add_space(SP_XS);
                     let mut recheck = false;
                     ui.horizontal(|ui| {
-                        let label = if matches!(self.install_status, InstallStatus::Stale(_) | InstallStatus::Partial(_)) { "UPDATE GAME FILES" } else { "INSTALL / REINSTALL" };
-                        if flat_button(ui, label) && !self.installing() {
+                        let label = if matches!(self.install_status, InstallStatus::Stale(_) | InstallStatus::Partial(_)) { "Update game files" } else { "Install / reinstall" };
+                        if ghost_button(ui, label, Some(Icon::Refresh)) && !self.installing() {
                             self.install_open = true;
                             self.page = Page::Play;
                         }
-                        if flat_button(ui, "OPEN ASSETS FOLDER") {
+                        if ghost_button(ui, "Open assets folder", Some(Icon::Folder)) {
                             err = game::open_path(&f.assets_root).err();
                         }
-                        if flat_button(ui, "CHECK AGAIN") {
+                        if ghost_button(ui, "Check again", Some(Icon::Check)) {
                             self.poller.refresh();
                             recheck = true;
                         }
@@ -2095,52 +2759,44 @@ impl LauncherApp {
                     if recheck {
                         self.check_install(ui.ctx(), snap.files.assets_root.clone());
                     }
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Install builds the files from your Apex install (tools\\install.ps1) and points the game at them (assets_root in r5rust.toml).")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
                 });
 
-                section(ui, "LAUNCHER", |ui| {
+                section(ui, "LAUNCHER", None, |ui| {
                     if toggle_row(
                         ui,
                         &mut self.console_on_launch,
                         "Open the Console when the game starts",
                         "Jump to the game's live output on every launch.",
                         true,
-                    ) && let Err(e) =
-                        game::write_setting("console_on_launch.txt", if self.console_on_launch { "1" } else { "0" })
+                    ) && let Err(e) = game::write_setting("console_on_launch.txt", if self.console_on_launch { "1" } else { "0" })
                     {
                         err = Some(format!("Couldn't save: {e}"));
                     }
-                    ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        if flat_button(ui, "GAME SETTINGS FILE") {
+                        if ghost_button(ui, "Game settings file", Some(Icon::Doc)) {
                             err = game::open_path(&GameSettings::path(&self.game_root)).err();
                         }
                         let dir = game::data_dir().unwrap_or_default();
-                        if flat_button(ui, "LAST GAME LOG") {
+                        if ghost_button(ui, "Last game log", Some(Icon::Doc)) {
                             err = game::open_path(&dir.join("game.log")).err();
                         }
-                        if flat_button(ui, "LAST BUILD LOG") {
+                        if ghost_button(ui, "Last build log", Some(Icon::Doc)) {
                             err = game::open_path(&dir.join("build.log")).err();
                         }
                     });
                 });
 
-                section(ui, "ABOUT", |ui| {
+                section(ui, "ABOUT", None, |ui| {
                     ui.label(
                         RichText::new(format!(
                             "R5Rust Launcher v{}. Play runs play.ps1, which installs a staged build first. Build latest runs tools\\publish.ps1 (cargo build + stage) and never touches the copy you're playing. Press Enter to play from any page.",
                             env!("CARGO_PKG_VERSION")
                         ))
-                        .size(13.0)
+                        .size(T_BODY - 0.5)
                         .color(SECONDARY),
                     );
                 });
-                ui.add_space(24.0);
+                ui.add_space(SP_XL);
             });
         });
         if let Some(e) = err {
@@ -2171,10 +2827,10 @@ fn draw_window_chrome(ctx: &egui::Context, maximized: bool) -> ChromeAction {
         .default_size(bar_size)
         .show(ctx, |ui| {
             let (bar, _) = ui.allocate_exact_size(bar_size, Sense::hover());
-            let close = Rect::from_min_size(Pos2::new(bar.right() - 40.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
-            let maximize = Rect::from_min_size(Pos2::new(close.left() - 38.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
-            let minimize =
-                Rect::from_min_size(Pos2::new(maximize.left() - 38.0, bar.top() + 3.0), Vec2::new(36.0, 30.0));
+            let btn = Vec2::new(44.0, 32.0);
+            let close = Rect::from_min_size(Pos2::new(bar.right() - btn.x, bar.top()), btn);
+            let maximize = close.translate(Vec2::new(-btn.x, 0.0));
+            let minimize = maximize.translate(Vec2::new(-btn.x, 0.0));
             let drag_area = Rect::from_min_max(bar.min, Pos2::new(minimize.left(), bar.bottom()));
             let drag = ui.interact(drag_area, egui::Id::new("window-drag-area"), Sense::click_and_drag());
             if drag.drag_started() {
@@ -2192,26 +2848,26 @@ fn draw_window_chrome(ctx: &egui::Context, maximized: bool) -> ChromeAction {
             let close_r = ui.interact(close, egui::Id::new("window-close"), Sense::click());
             let painter = ui.painter();
             if min_r.hovered() {
-                painter.rect_filled(minimize, Rounding::same(0.0), HOVER);
+                painter.rect_filled(minimize, Rounding::ZERO, glass(HOVER, 220));
             }
             if max_r.hovered() {
-                painter.rect_filled(maximize, Rounding::same(0.0), HOVER);
+                painter.rect_filled(maximize, Rounding::ZERO, glass(HOVER, 220));
             }
             if close_r.hovered() {
-                painter.rect_filled(close, Rounding::same(0.0), Color32::from_rgb(224, 68, 58));
+                painter.rect_filled(close, Rounding::ZERO, ACCENT);
             }
             let s = Stroke::new(1.2_f32, TEXT);
             let m = minimize.center();
-            painter.line_segment([Pos2::new(m.x - 5.0, m.y + 3.0), Pos2::new(m.x + 5.0, m.y + 3.0)], s);
+            painter.line_segment([Pos2::new(m.x - 5.0, m.y), Pos2::new(m.x + 5.0, m.y)], s);
             if maximized {
                 // Restore: two overlapping squares.
                 let front = Rect::from_center_size(maximize.center() + Vec2::new(-1.5, 1.5), Vec2::splat(9.0));
                 let back = front.translate(Vec2::new(3.0, -3.0));
                 painter.line_segment([Pos2::new(back.left(), back.top()), Pos2::new(back.right(), back.top())], s);
                 painter.line_segment([Pos2::new(back.right(), back.top()), Pos2::new(back.right(), back.bottom())], s);
-                painter.rect_stroke(front, Rounding::same(0.0), s);
+                painter.rect_stroke(front, Rounding::same(1.0), s);
             } else {
-                painter.rect_stroke(maximize.shrink(10.0), Rounding::same(0.0), s);
+                painter.rect_stroke(Rect::from_center_size(maximize.center(), Vec2::splat(10.0)), Rounding::same(1.0), s);
             }
             let c = close.center();
             painter.line_segment([Pos2::new(c.x - 5.0, c.y - 5.0), Pos2::new(c.x + 5.0, c.y + 5.0)], s);
@@ -2246,10 +2902,7 @@ fn work_area_at(x: i32, y: i32) -> Option<Rect> {
             return None;
         }
         let w = info.rcWork;
-        Some(Rect::from_min_max(
-            Pos2::new(w.left as f32, w.top as f32),
-            Pos2::new(w.right as f32, w.bottom as f32),
-        ))
+        Some(Rect::from_min_max(Pos2::new(w.left as f32, w.top as f32), Pos2::new(w.right as f32, w.bottom as f32)))
     }
 }
 
@@ -2258,18 +2911,8 @@ fn work_area_at(_x: i32, _y: i32) -> Option<Rect> {
     None
 }
 
-fn paint_vertical_scrim(painter: &egui::Painter, bounds: Rect, top_alpha: u8, bottom_alpha: u8) {
-    let (t, b) = (Color32::from_black_alpha(top_alpha), Color32::from_black_alpha(bottom_alpha));
-    paint_scrim_colors(painter, bounds, [t, t, b, b]);
-}
-
-fn paint_horizontal_scrim(painter: &egui::Painter, bounds: Rect, left_alpha: u8, right_alpha: u8) {
-    let (l, r) = (Color32::from_black_alpha(left_alpha), Color32::from_black_alpha(right_alpha));
-    paint_scrim_colors(painter, bounds, [l, r, r, l]);
-}
-
-/// Colours for the corners top-left, top-right, bottom-right, bottom-left.
-fn paint_scrim_colors(painter: &egui::Painter, b: Rect, c: [Color32; 4]) {
+/// A rect with a colour per corner: top-left, top-right, bottom-right, bottom-left.
+fn paint_gradient(painter: &egui::Painter, b: Rect, c: [Color32; 4]) {
     let mut mesh = egui::Mesh::default();
     for (pos, color) in [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()].into_iter().zip(c) {
         mesh.colored_vertex(pos, color);
@@ -2306,16 +2949,20 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.menu_margin = Margin::same(8.0);
+    style.spacing.menu_margin = Margin::same(SP_S);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
-    v.window_fill = BG;
-    v.extreme_bg_color = RAISED;
+    v.window_fill = PANEL;
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
+    v.window_rounding = Rounding::same(R_CARD);
+    v.menu_rounding = Rounding::same(R_CARD);
+    v.popup_shadow = egui::epaint::Shadow { offset: Vec2::new(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(150) };
+    v.extreme_bg_color = Color32::from_rgb(8, 9, 11);
     v.override_text_color = Some(TEXT);
-    // Text selection and the slider's trailing fill share this colour.
-    v.selection.bg_fill = Color32::from_rgb(40, 140, 168);
-    v.selection.stroke = Stroke::new(1.0_f32, CYAN);
-    v.text_cursor.stroke = Stroke::new(2.0_f32, CYAN);
+    // text selection (the slider's trailing fill is set per slider)
+    v.selection.bg_fill = Color32::from_rgb(110, 30, 36);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT_HI);
+    v.text_cursor.stroke = Stroke::new(2.0_f32, ACCENT_HI);
     v.slider_trailing_fill = true;
     v.widgets.noninteractive.bg_fill = PANEL;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
@@ -2327,17 +2974,17 @@ fn apply_theme(ctx: &egui::Context) {
     ] {
         w.bg_fill = fill;
         w.weak_bg_fill = fill;
-        w.bg_stroke = Stroke::NONE;
+        w.bg_stroke = Stroke::new(1.0_f32, BORDER);
         w.fg_stroke.color = fg;
-        w.rounding = Rounding::same(0.0);
+        w.rounding = Rounding::same(R_CTRL);
         w.expansion = 0.0;
     }
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, CYAN);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(74, 80, 90));
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     style.visuals = v;
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.item_spacing = Vec2::new(SP_S, SP_S);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
-    style.spacing.slider_width = 360.0;
+    style.spacing.slider_width = 380.0;
     style.spacing.slider_rail_height = 4.0;
     style.spacing.interact_size.y = 22.0;
     ctx.set_style(style);
